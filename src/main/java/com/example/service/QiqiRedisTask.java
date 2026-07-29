@@ -1,4 +1,4 @@
-package com.example;
+package com.example.service;
 
 import java.util.ArrayList;
 
@@ -9,6 +9,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
+
+import com.example.entity.Taoli;
+
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
@@ -25,7 +28,7 @@ public class QiqiRedisTask {
     @Getter
     private volatile ArrayList<Taoli> taoliList = new ArrayList<>();
 
-    @Scheduled(fixedRate = 1000)
+    @Scheduled(fixedRate = 5000)
     public void refreshQiqi() {
         try {
             String value = stringRedisTemplate.opsForValue().get(KEY);

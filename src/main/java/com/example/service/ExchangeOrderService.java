@@ -277,7 +277,7 @@ public class ExchangeOrderService {
             throw new IllegalArgumentException("Hyperliquid ak, ac and ap are required");
         }
         requireAddress(api.getAk(), "Hyperliquid account address");
-        requireAddress(api.getAc(), "Hyperliquid agent address");
+        requireAddress(api.getAp(), "Hyperliquid agent address");
         if (request.getTemplate() == null || request.getTemplate().getUs() == null
                 || request.getTemplate().getUs().signum() <= 0) {
             throw new IllegalArgumentException("template.us must be greater than 0");
@@ -309,7 +309,7 @@ public class ExchangeOrderService {
 
         long nonce = System.currentTimeMillis();
         long expiresAfter = nonce + 30_000L;
-        Signature signature = signHyperliquidAction(api.getAp(), action, nonce, expiresAfter);
+        Signature signature = signHyperliquidAction(api.getAc(), action, nonce, expiresAfter);
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("action", action);
         body.put("nonce", nonce);
@@ -327,7 +327,7 @@ public class ExchangeOrderService {
     }
 
     private Asset loadHyperliquidAsset(String requestedCoin) throws Exception {
-        String coin = requestedCoin.toUpperCase(Locale.ROOT);
+        String coin = requestedCoin.trim().toUpperCase(Locale.ROOT);
         long now = System.currentTimeMillis();
         AssetCache cached = hyperliquidAssetCache.get(coin);
         if (cached != null && cached.expiresAt() > now) {
@@ -340,28 +340,68 @@ public class ExchangeOrderService {
             throw new IllegalStateException("Hyperliquid info request is cooling down after rate limit");
         }
 
-        HttpResponse<String> response = send("https://api.hyperliquid.xyz/info", "POST",
-                "{\"type\":\"metaAndAssetCtxs\"}", Map.of());
-        if (response.statusCode() == 429) {
-            hyperliquidInfoRetryAt = now + HYPER_INFO_RETRY_MILLIS;
+        if (coin.contains(":")) {
+            String dex = coin.substring(0, coin.indexOf(':'));
+            Asset asset = loadHyperliquidAssetFromDex(dex, coin, 110000, now);
+            if (asset != null) {
+                hyperliquidAssetCache.put(coin, new AssetCache(asset, now + HYPER_INFO_CACHE_MILLIS));
+                return asset;
+            }
+        } else {
+            Asset asset = loadHyperliquidAssetFromDex("", coin, 0, now);
+            if (asset != null) {
+                hyperliquidAssetCache.put(coin, new AssetCache(asset, now + HYPER_INFO_CACHE_MILLIS));
+                return asset;
+            }
+
+            JsonNode perpDexes = requestHyperliquidInfo("{\"type\":\"perpDexs\"}", now);
+            int dexOffsetIndex = 0;
+            for (int i = 1; i < perpDexes.size(); i++) {
+                JsonNode dexNode = perpDexes.get(i);
+                if (dexNode == null || dexNode.isNull()) continue;
+                String dex = text(dexNode, "name");
+                if (dex.isBlank()) continue;
+                Asset hip3Asset = loadHyperliquidAssetFromDex(dex, dex + ":" + coin,
+                        110000 + dexOffsetIndex * 10000, now);
+                if (hip3Asset != null) {
+                    hyperliquidAssetCache.put(coin, new AssetCache(hip3Asset, now + HYPER_INFO_CACHE_MILLIS));
+                    return hip3Asset;
+                }
+                dexOffsetIndex++;
+            }
         }
-        JsonNode root = objectMapper.readTree(requireSuccess(response, "Hyperliquid info"));
+
+        hyperliquidAssetCache.put(coin, new AssetCache(null, now + HYPER_INFO_CACHE_MILLIS));
+        throw new IllegalArgumentException("Hyperliquid coin not found: " + requestedCoin);
+    }
+
+    private Asset loadHyperliquidAssetFromDex(String dex, String requestedCoin, int assetOffset, long now)
+            throws Exception {
+        String requestBody = objectMapper.writeValueAsString(Map.of(
+                "type", "metaAndAssetCtxs",
+                "dex", dex));
+        JsonNode root = requestHyperliquidInfo(requestBody, now);
         JsonNode universe = root.get(0).get("universe");
         JsonNode contexts = root.get(1);
         for (int i = 0; i < universe.size(); i++) {
             JsonNode row = universe.get(i);
-            if (!coin.equals(text(row, "name"))) continue;
+            if (!requestedCoin.equalsIgnoreCase(text(row, "name"))) continue;
             JsonNode context = contexts.get(i);
             String mid = text(context, "midPx");
             if (mid.isBlank()) mid = text(context, "markPx");
             BigDecimal price = new BigDecimal(mid);
             if (price.signum() <= 0) throw new IllegalStateException("Hyperliquid mid price unavailable");
-            Asset asset = new Asset(i, Integer.parseInt(text(row, "szDecimals")), price);
-            hyperliquidAssetCache.put(coin, new AssetCache(asset, now + HYPER_INFO_CACHE_MILLIS));
-            return asset;
+            return new Asset(assetOffset + i, Integer.parseInt(text(row, "szDecimals")), price);
         }
-        hyperliquidAssetCache.put(coin, new AssetCache(null, now + HYPER_INFO_CACHE_MILLIS));
-        throw new IllegalArgumentException("Hyperliquid coin not found: " + requestedCoin);
+        return null;
+    }
+
+    private JsonNode requestHyperliquidInfo(String requestBody, long now) throws Exception {
+        HttpResponse<String> response = send("https://api.hyperliquid.xyz/info", "POST", requestBody, Map.of());
+        if (response.statusCode() == 429) {
+            hyperliquidInfoRetryAt = now + HYPER_INFO_RETRY_MILLIS;
+        }
+        return objectMapper.readTree(requireSuccess(response, "Hyperliquid info"));
     }
 
     private static boolean isHyperliquid(OrderRequest.ExchangeApi api) {

@@ -9,7 +9,7 @@ POST /order
 Content-Type: application/json
 ```
 
-请求体接收原始 JSON，不绑定固定实体类。例如：
+请求体绑定为 `OrderRequest` 实体类。例如：
 
 ```json
 {

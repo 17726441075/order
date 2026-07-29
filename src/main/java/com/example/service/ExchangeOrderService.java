@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -47,7 +48,11 @@ public class ExchangeOrderService {
             .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(8)).build();
+    private static final long HYPER_INFO_CACHE_MILLIS = 1_000L;
+    private static final long HYPER_INFO_RETRY_MILLIS = 3_000L;
     private final ObjectMapper objectMapper;
+    private final Map<String, AssetCache> hyperliquidAssetCache = new ConcurrentHashMap<>();
+    private volatile long hyperliquidInfoRetryAt;
 
     public Map<String, Object> placeOpenOrders(OrderRequest request) throws Exception {
         if (request == null || request.getTemplate() == null || request.getTemplate().getUs() == null
@@ -191,6 +196,10 @@ public class ExchangeOrderService {
 
     private HttpResponse<String> send(String url, String method, String body, Map<String, String> headers)
             throws Exception {
+        boolean orderRequest = url.contains("/order") || url.endsWith("/exchange");
+        if (orderRequest) {
+            log.info("Order request: method={}, url={}, body={}", method, url, body);
+        }
         HttpRequest.Builder builder = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10));
         headers.forEach(builder::header);
         if ("POST".equals(method)) {
@@ -199,7 +208,12 @@ public class ExchangeOrderService {
         } else {
             builder.method(method, HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
         }
-        return HTTP_CLIENT.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = HTTP_CLIENT.send(builder.build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (orderRequest) {
+            log.info("Order response: status={}, body={}", response.statusCode(), response.body());
+        }
+        return response;
     }
 
     private String requireSuccess(HttpResponse<String> response, String exchange) {
@@ -259,10 +273,11 @@ public class ExchangeOrderService {
             isBuy = true;
         }
         if (api == null) return Map.of("message", "no hyperliquid leg");
-        if (blank(api.getAk()) || blank(api.getAc())) {
-            throw new IllegalArgumentException("Hyperliquid ak and ac are required");
+        if (blank(api.getAk()) || blank(api.getAc()) || blank(api.getAp())) {
+            throw new IllegalArgumentException("Hyperliquid ak, ac and ap are required");
         }
         requireAddress(api.getAk(), "Hyperliquid account address");
+        requireAddress(api.getAc(), "Hyperliquid agent address");
         if (request.getTemplate() == null || request.getTemplate().getUs() == null
                 || request.getTemplate().getUs().signum() <= 0) {
             throw new IllegalArgumentException("template.us must be greater than 0");
@@ -294,7 +309,7 @@ public class ExchangeOrderService {
 
         long nonce = System.currentTimeMillis();
         long expiresAfter = nonce + 30_000L;
-        Signature signature = signHyperliquidAction(api.getAc(), action, nonce, expiresAfter);
+        Signature signature = signHyperliquidAction(api.getAp(), action, nonce, expiresAfter);
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("action", action);
         body.put("nonce", nonce);
@@ -312,12 +327,27 @@ public class ExchangeOrderService {
     }
 
     private Asset loadHyperliquidAsset(String requestedCoin) throws Exception {
+        String coin = requestedCoin.toUpperCase(Locale.ROOT);
+        long now = System.currentTimeMillis();
+        AssetCache cached = hyperliquidAssetCache.get(coin);
+        if (cached != null && cached.expiresAt() > now) {
+            if (cached.asset() == null) {
+                throw new IllegalArgumentException("Hyperliquid coin not found: " + requestedCoin);
+            }
+            return cached.asset();
+        }
+        if (now < hyperliquidInfoRetryAt) {
+            throw new IllegalStateException("Hyperliquid info request is cooling down after rate limit");
+        }
+
         HttpResponse<String> response = send("https://api.hyperliquid.xyz/info", "POST",
                 "{\"type\":\"metaAndAssetCtxs\"}", Map.of());
+        if (response.statusCode() == 429) {
+            hyperliquidInfoRetryAt = now + HYPER_INFO_RETRY_MILLIS;
+        }
         JsonNode root = objectMapper.readTree(requireSuccess(response, "Hyperliquid info"));
         JsonNode universe = root.get(0).get("universe");
         JsonNode contexts = root.get(1);
-        String coin = requestedCoin.toUpperCase(Locale.ROOT);
         for (int i = 0; i < universe.size(); i++) {
             JsonNode row = universe.get(i);
             if (!coin.equals(text(row, "name"))) continue;
@@ -326,8 +356,11 @@ public class ExchangeOrderService {
             if (mid.isBlank()) mid = text(context, "markPx");
             BigDecimal price = new BigDecimal(mid);
             if (price.signum() <= 0) throw new IllegalStateException("Hyperliquid mid price unavailable");
-            return new Asset(i, Integer.parseInt(text(row, "szDecimals")), price);
+            Asset asset = new Asset(i, Integer.parseInt(text(row, "szDecimals")), price);
+            hyperliquidAssetCache.put(coin, new AssetCache(asset, now + HYPER_INFO_CACHE_MILLIS));
+            return asset;
         }
+        hyperliquidAssetCache.put(coin, new AssetCache(null, now + HYPER_INFO_CACHE_MILLIS));
         throw new IllegalArgumentException("Hyperliquid coin not found: " + requestedCoin);
     }
 
@@ -427,6 +460,8 @@ public class ExchangeOrderService {
     }
 
     private record Asset(int assetId, int szDecimals, BigDecimal midPrice) {}
+
+    private record AssetCache(Asset asset, long expiresAt) {}
 
     private record Signature(String r, String s, int v) {
         Map<String, Object> toMap() { return Map.of("r", r, "s", s, "v", v); }

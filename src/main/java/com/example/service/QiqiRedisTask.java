@@ -42,29 +42,14 @@ public class QiqiRedisTask {
             if (!StringUtils.hasText(value)) {
                 taoliList = new ArrayList<>();
                 usersList = readUsers();
-                logLists();
-                log.info("Taoli list size: {}", taoliList.size());
                 processUsers();
                 return;
             }
             taoliList = new ArrayList<>(Arrays.asList(objectMapper.readValue(value, Taoli[].class)));
             usersList = readUsers();
-            logLists();
-            log.info("Taoli list size: {}", taoliList.size());
             processUsers();
         } catch (Exception e) {
             log.error("Failed to read Redis key {}", KEY, e);
-        }
-    }
-
-    private void logLists() {
-        for (OrderRequest user : usersList) {
-            log.info("User: coin={}, userId={}, longExchange={}, shortExchange={}, ta2={}",
-                    user.getCoin(),
-                    user.getTemplate() == null ? null : user.getTemplate().getUr(),
-                    user.getLongApi() == null ? null : user.getLongApi().getEe(),
-                    user.getShortApi() == null ? null : user.getShortApi().getEe(),
-                    user.getTemplate() == null ? null : user.getTemplate().getTa2());
         }
     }
 
@@ -75,7 +60,14 @@ public class QiqiRedisTask {
         }
         try {
             for (int index = 0; index < usersList.size(); index++) {
-                tryOpenForUser(index, usersList.get(index));
+                OrderRequest user = usersList.get(index);
+                try {
+                    tryOpenForUser(index, user);
+                } catch (Exception e) {
+                    log.error("Arbitrage user processing failed: userId={}, coin={}; continue with next user",
+                            user == null || user.getTemplate() == null ? null : user.getTemplate().getUr(),
+                            user == null ? null : user.getCoin(), e);
+                }
             }
         } finally {
             processing.set(false);
@@ -93,11 +85,15 @@ public class QiqiRedisTask {
         }
 
         Taoli quote = findQuote(user);
-        if (quote == null || quote.getOpenCha() == null || quote.getAllFee() == null) {
+        if (quote == null || quote.getOpenCha() == null) {
             return;
         }
+        log.info("Arbitrage quote matched: userId={}, coin={}, longExchange={}, shortExchange={}",
+                template.getUr(), user.getCoin(),
+                user.getLongApi() == null ? null : user.getLongApi().getEe(),
+                user.getShortApi() == null ? null : user.getShortApi().getEe());
         if (quote.getOpenCha().compareTo(template.getBy()) < 0
-                || quote.getAllFee().compareTo(template.getAf()) < 0) {
+                || (quote.getAllFee() != null && quote.getAllFee().compareTo(template.getAf()) < 0)) {
             return;
         }
 
@@ -144,7 +140,17 @@ public class QiqiRedisTask {
     }
 
     private boolean same(String left, String right) {
-        return left != null && right != null && left.trim().equalsIgnoreCase(right.trim());
+        return left != null && right != null
+                && normalizeExchange(left).equals(normalizeExchange(right));
+    }
+
+    private String normalizeExchange(String exchange) {
+        String value = exchange.trim().toLowerCase();
+        return switch (value) {
+            case "hyper" -> "hyperliquid";
+            case "gateio" -> "gate";
+            default -> value;
+        };
     }
 
     private ArrayList<OrderRequest> readUsers() throws Exception {
@@ -153,11 +159,25 @@ public class QiqiRedisTask {
         if (values == null) {
             return result;
         }
-        for (String value : values) {
+        for (int index = 0; index < values.size(); index++) {
+            String value = values.get(index);
             if (StringUtils.hasText(value)) {
-                result.add(objectMapper.readValue(value, OrderRequest.class));
+                try {
+                    result.add(readUser(value));
+                } catch (Exception e) {
+                    log.error("Failed to parse user JSON in Redis list at index {}; skip this user", index, e);
+                }
             }
         }
         return result;
+    }
+
+    private OrderRequest readUser(String value) throws Exception {
+        try {
+            return objectMapper.readValue(value, OrderRequest.class);
+        } catch (Exception ignored) {
+            String normalized = value.replace("\r", "").replace("\n", "");
+            return objectMapper.readValue(normalized, OrderRequest.class);
+        }
     }
 }

@@ -1,6 +1,7 @@
 package com.example.service;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -12,7 +13,6 @@ import org.springframework.util.StringUtils;
 
 import com.example.entity.Taoli;
 
-import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
 @Slf4j
@@ -20,8 +20,6 @@ import tools.jackson.databind.ObjectMapper;
 @RequiredArgsConstructor
 public class QiqiRedisTask {
     private static final String KEY = "qiqi";
-    private static final TypeReference<ArrayList<Taoli>> TAOLI_LIST_TYPE = new TypeReference<>() {
-    };
 
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
@@ -37,7 +35,7 @@ public class QiqiRedisTask {
                 log.info("Taoli list size: {}", taoliList.size());
                 return;
             }
-            taoliList = objectMapper.readValue(value, TAOLI_LIST_TYPE);
+            taoliList = new ArrayList<>(Arrays.asList(objectMapper.readValue(value, Taoli[].class)));
             log.info("Taoli list size: {}", taoliList.size());
         } catch (Exception e) {
             log.error("Failed to read Redis key {}", KEY, e);

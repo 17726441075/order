@@ -28,7 +28,7 @@ public class QiqiRedisTask {
     @Getter
     private volatile ArrayList<Taoli> taoliList = new ArrayList<>();
 
-    @Scheduled(fixedRate = 5000)
+    @Scheduled(fixedRate = 100)
     public void refreshQiqi() {
         try {
             String value = stringRedisTemplate.opsForValue().get(KEY);

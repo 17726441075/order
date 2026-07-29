@@ -78,7 +78,7 @@
                                 <argument>-i</argument>
                                 <argument>D:\pzl\pzl.pem</argument>
                                 <argument>root@47.91.31.90</argument>
-                                <argument>systemctl restart sign</argument>
+                                <argument>systemctl restart order</argument>
                             </arguments>
                         </configuration>
                     </execution>

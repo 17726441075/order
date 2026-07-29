@@ -65,6 +65,9 @@ public class OrderRequest {
         /** 开仓总额。 */
         private BigDecimal ta;
 
+        /** 已经总额。 */
+        private BigDecimal ta2;
+
         /** 单笔开仓金额。 */
         private BigDecimal us;
 

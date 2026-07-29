@@ -1,11 +1,14 @@
 server:
   port: 8081
+  shutdown: immediate
 logging:
   file:
     name: /root/order.log
   level:
     root: INFO
 spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 1s
   data:
     redis:
       host: 127.0.0.1

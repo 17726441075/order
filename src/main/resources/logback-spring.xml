@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>/root/order.log</file>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level --- [%thread] %logger{40} : %msg%n</pattern>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.FixedWindowRollingPolicy">
+            <fileNamePattern>/root/order.log%i</fileNamePattern>
+            <minIndex>1</minIndex>
+            <maxIndex>1</maxIndex>
+        </rollingPolicy>
+        <triggeringPolicy class="ch.qos.logback.core.rolling.SizeBasedTriggeringPolicy">
+            <maxFileSize>512MB</maxFileSize>
+        </triggeringPolicy>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="FILE"/>
+    </root>
+</configuration>

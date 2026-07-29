@@ -75,6 +75,8 @@
                         <configuration>
                             <executable>ssh</executable>
                             <arguments>
+                                <argument>-f</argument>
+                                <argument>-n</argument>
                                 <argument>-i</argument>
                                 <argument>D:\pzl\pzl.pem</argument>
                                 <argument>root@47.91.31.90</argument>

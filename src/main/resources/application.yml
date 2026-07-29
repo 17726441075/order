@@ -1,2 +1,7 @@
 server:
   port: 8081
+logging:
+  file:
+    name: /root/order.log
+  level:
+    root: INFO

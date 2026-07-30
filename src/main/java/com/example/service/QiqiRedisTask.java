@@ -113,7 +113,7 @@ public class QiqiRedisTask {
                 user.getShortApi() == null ? null : user.getShortApi().getEe(),
                 quote.getOpenCha(), quote.getAllFee(), orderAmount, openedAmount, template.getTa());
         try {
-            exchangeOrderService.placeOpenOrders(user);
+            exchangeOrderService.placeOpenOrders(user, quote);
             template.setTa2(openedAmount.add(orderAmount));
             stringRedisTemplate.opsForList().set(USERS_KEY, userIndex, objectMapper.writeValueAsString(user));
             log.info("Arbitrage open after: userId={}, coin={}, amount={}, ta2={}",

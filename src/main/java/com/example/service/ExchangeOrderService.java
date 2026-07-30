@@ -2,6 +2,7 @@ package com.example.service;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.math.MathContext;
 import java.math.RoundingMode;
 import java.net.URI;
@@ -21,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -30,12 +32,15 @@ import lombok.extern.slf4j.Slf4j;
 import org.msgpack.core.MessageBufferPacker;
 import org.msgpack.core.MessagePack;
 import org.msgpack.core.MessagePacker;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.web3j.crypto.ECKeyPair;
 import org.web3j.crypto.Sign;
 import org.web3j.utils.Numeric;
 
 import com.example.entity.OrderRequest;
+import com.example.entity.Taoli;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -50,39 +55,244 @@ public class ExchangeOrderService {
             .connectTimeout(Duration.ofSeconds(8)).build();
     private static final long HYPER_INFO_CACHE_MILLIS = 1_000L;
     private static final long HYPER_INFO_RETRY_MILLIS = 3_000L;
+    private static final String POSITION_KEY_PREFIX = "qiqi:positon:";
     private final ObjectMapper objectMapper;
+    private final StringRedisTemplate stringRedisTemplate;
     private final Map<String, AssetCache> hyperliquidAssetCache = new ConcurrentHashMap<>();
     private volatile long hyperliquidInfoRetryAt;
 
-    public Map<String, Object> placeOpenOrders(OrderRequest request) throws Exception {
+    @Value("${ibkr.base-url}")
+    private String ibkrBaseUrl;
+
+    @Value("${ibkr.api-key}")
+    private String ibkrApiKey;
+
+    public Map<String, Object> placeOpenOrders(OrderRequest request, Taoli quote) throws Exception {
         if (request == null || request.getTemplate() == null || request.getTemplate().getUs() == null
                 || request.getTemplate().getUs().signum() <= 0) {
             throw new IllegalArgumentException("template.us must be greater than 0");
         }
+        BigDecimal baseQuantity = calculateMatchedBaseQuantity(request, quote);
         Map<String, Object> result = new LinkedHashMap<>();
-        Map<String, Object> hyperliquidResult = placeHyperliquidIfNeeded(request);
+        placeLeg(request, quote, baseQuantity, request.getLongApi(), true, result);
+        placeLeg(request, quote, baseQuantity, request.getShortApi(), false, result);
+        Map<String, Object> hyperliquidResult = placeHyperliquidIfNeeded(request, baseQuantity);
         if (!"no hyperliquid leg".equals(hyperliquidResult.get("message"))) {
             result.put("hyperliquid", hyperliquidResult);
         }
-        placeLeg(request.getCoin(), request.getTemplate().getUs(), request.getLongApi(), true, result);
-        placeLeg(request.getCoin(), request.getTemplate().getUs(), request.getShortApi(), false, result);
         return result;
     }
 
-    private void placeLeg(String coin, BigDecimal notional, OrderRequest.ExchangeApi api, boolean isLong,
-            Map<String, Object> result) throws Exception {
+    private void placeLeg(OrderRequest request, Taoli quote, BigDecimal baseQuantity,
+            OrderRequest.ExchangeApi api, boolean isLong, Map<String, Object> result) throws Exception {
         if (api == null || blank(api.getEe())) return;
         String exchange = api.getEe().trim().toLowerCase(Locale.ROOT);
-        BigDecimal size = notional;
         String response = switch (exchange) {
-            case "okx" -> orderOkx(coin, size, api, isLong);
-            case "binance" -> orderBinance(coin, size, api, isLong);
-            case "bybit" -> orderBybit(coin, size, api, isLong);
-            case "bitget" -> orderBitget(coin, size, api, isLong);
-            case "gate", "gateio" -> orderGate(coin, size, api, isLong);
-            default -> null;
+            case "ibkr" -> orderIbkr(request, baseQuantity, isLong);
+            case "okx" -> orderOkx(formatContract(request.getCoin(), exchange),
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong);
+            case "binance" -> orderBinance(formatContract(request.getCoin(), exchange),
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong);
+            case "bybit" -> orderBybit(formatContract(request.getCoin(), exchange),
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong);
+            case "bitget" -> orderBitget(formatContract(request.getCoin(), exchange),
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong);
+            case "gate", "gateio" -> orderGate(formatContract(request.getCoin(), exchange),
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong);
+            case "hyper", "hyperliquid" -> null;
+            default -> throw new IllegalArgumentException("Unsupported exchange: " + api.getEe());
         };
         if (response != null) result.put((isLong ? "long" : "short") + exchange, response);
+    }
+
+    private String orderIbkr(OrderRequest request, BigDecimal baseQuantity, boolean isLong) throws Exception {
+        String requestId = createIbkrRequestId(request, isLong);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("requestId", requestId);
+        body.put("coin", request.getCoin());
+        body.put("side", isLong ? "BUY" : "SELL");
+        body.put("quantity", baseQuantity);
+        body.put("preview", false);
+        body.put("reduceOnly", false);
+        String requestBody = objectMapper.writeValueAsString(body);
+        Map<String, String> headers = Map.of(
+                "X-Taoli-Api-Key", required(ibkrApiKey, "IBKR downstream apiKey"));
+        HttpResponse<String> response = send(ibkrUrl("/api/ibkr/orders/market"),
+                "POST", requestBody, headers);
+        String responseBody = requireSuccess(response, "IBKR");
+        JsonNode order = objectMapper.readTree(responseBody);
+        if ("filled".equalsIgnoreCase(text(order, "status"))) {
+            return responseBody;
+        }
+        return waitForIbkrOrder(requestId, headers);
+    }
+
+    private String waitForIbkrOrder(String requestId, Map<String, String> headers) throws Exception {
+        String lastResponse = "";
+        for (int attempt = 0; attempt < 15; attempt++) {
+            Thread.sleep(1_000L);
+            HttpResponse<String> response = send(ibkrUrl("/api/ibkr/orders/" + requestId),
+                    "GET", "", headers);
+            lastResponse = requireSuccess(response, "IBKR order query");
+            JsonNode order = objectMapper.readTree(lastResponse);
+            String status = text(order, "status");
+            log.info("IBKR order status: requestId={}, status={}, filled={}, remaining={}",
+                    requestId, status, text(order, "filled"), text(order, "remaining"));
+            if ("filled".equalsIgnoreCase(status)) {
+                return lastResponse;
+            }
+            if (isIbkrFinalFailure(status)) {
+                throw new IllegalStateException(
+                        "IBKR order failed: requestId=" + requestId + ", response=" + lastResponse);
+            }
+        }
+        throw new IllegalStateException(
+                "IBKR order status timeout: requestId=" + requestId + ", response=" + lastResponse);
+    }
+
+    private BigDecimal calculateExchangeSize(
+            String exchange, BigDecimal baseQuantity, Taoli quote, boolean isLong) {
+        BigDecimal step = isLong ? quote.getLongLot() : quote.getShortLot();
+        BigDecimal size = baseQuantity;
+        if ("okx".equals(exchange) || "gate".equals(exchange) || "gateio".equals(exchange)) {
+            BigDecimal multiplier = isLong ? quote.getLongMutil() : quote.getShortMutil();
+            if (multiplier == null || multiplier.signum() <= 0) {
+                throw new IllegalArgumentException(exchange + " contract multiplier is unavailable");
+            }
+            size = baseQuantity.divide(multiplier, 18, RoundingMode.DOWN);
+            if ("gate".equals(exchange) || "gateio".equals(exchange)) {
+                step = BigDecimal.ONE;
+            }
+        }
+        if (step != null && step.signum() > 0) {
+            size = size.divide(step, 0, RoundingMode.DOWN).multiply(step);
+        } else {
+            size = size.setScale(8, RoundingMode.DOWN);
+        }
+        size = size.stripTrailingZeros();
+        if (size.signum() <= 0) {
+            throw new IllegalArgumentException(exchange + " order amount is below the minimum size");
+        }
+        return size;
+    }
+
+    private BigDecimal calculateMatchedBaseQuantity(OrderRequest request, Taoli quote) throws Exception {
+        if (quote == null) {
+            throw new IllegalArgumentException("arbitrage quote is required");
+        }
+        BigDecimal longPrice = orderPrice(quote, true);
+        BigDecimal shortPrice = orderPrice(quote, false);
+        if (longPrice == null || shortPrice == null) {
+            throw new IllegalArgumentException("arbitrage order price is unavailable");
+        }
+        BigDecimal notional = request.getTemplate().getUs();
+        BigDecimal longMaximum = notional.divide(longPrice, 18, RoundingMode.DOWN);
+        BigDecimal shortMaximum = notional.divide(shortPrice, 18, RoundingMode.DOWN);
+        BigDecimal commonStep = commonQuantityStep(
+                baseQuantityStep(request.getCoin(), request.getLongApi(), quote, true),
+                baseQuantityStep(request.getCoin(), request.getShortApi(), quote, false));
+        BigDecimal quantity = longMaximum.min(shortMaximum)
+                .divide(commonStep, 0, RoundingMode.DOWN)
+                .multiply(commonStep)
+                .stripTrailingZeros();
+        if (quantity.signum() <= 0) {
+            throw new IllegalArgumentException("order amount is below the common minimum quantity");
+        }
+        log.info("Matched order quantity: coin={}, quantity={}, longBudget={}, shortBudget={}, step={}",
+                request.getCoin(), quantity, quantity.multiply(longPrice),
+                quantity.multiply(shortPrice), commonStep);
+        return quantity;
+    }
+
+    private BigDecimal baseQuantityStep(String coin, OrderRequest.ExchangeApi api, Taoli quote, boolean isLong)
+            throws Exception {
+        if (api == null || blank(api.getEe())) {
+            throw new IllegalArgumentException((isLong ? "long" : "short") + " exchange is required");
+        }
+        String exchange = api.getEe().trim().toLowerCase(Locale.ROOT);
+        BigDecimal lot = isLong ? quote.getLongLot() : quote.getShortLot();
+        BigDecimal minimum = isLong ? quote.getLongMinSz() : quote.getShortMinSz();
+        return switch (exchange) {
+            case "okx" -> positive(lot, "OKX lot size")
+                    .multiply(positive(isLong ? quote.getLongMutil() : quote.getShortMutil(),
+                            "OKX contract multiplier"));
+            case "gate", "gateio" -> positive(
+                    isLong ? quote.getLongMutil() : quote.getShortMutil(), "Gate contract multiplier");
+            case "hyper", "hyperliquid" -> BigDecimal.ONE.movePointLeft(loadHyperliquidAsset(coin).szDecimals());
+            default -> firstPositive(lot, minimum, new BigDecimal("0.00000001"));
+        };
+    }
+
+    private static BigDecimal commonQuantityStep(BigDecimal first, BigDecimal second) {
+        BigDecimal left = positive(first, "long quantity step").stripTrailingZeros();
+        BigDecimal right = positive(second, "short quantity step").stripTrailingZeros();
+        int scale = Math.max(Math.max(left.scale(), right.scale()), 0);
+        BigInteger leftUnits = left.movePointRight(scale).toBigIntegerExact();
+        BigInteger rightUnits = right.movePointRight(scale).toBigIntegerExact();
+        BigInteger lcm = leftUnits.divide(leftUnits.gcd(rightUnits)).multiply(rightUnits);
+        return new BigDecimal(lcm, scale).stripTrailingZeros();
+    }
+
+    private static BigDecimal positive(BigDecimal value, String name) {
+        if (value == null || value.signum() <= 0) {
+            throw new IllegalArgumentException(name + " is unavailable");
+        }
+        return value;
+    }
+
+    private String createIbkrRequestId(OrderRequest request, boolean isLong) {
+        String logicalOrder = request.getTemplate().getUr() + "|" + request.getCoin() + "|"
+                + (isLong ? "BUY" : "SELL") + "|" + request.getTemplate().getTa2() + "|"
+                + request.getTemplate().getUs();
+        return "qiqi-" + UUID.nameUUIDFromBytes(logicalOrder.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String ibkrUrl(String path) {
+        return ibkrBaseUrl.replaceAll("/+$", "") + path;
+    }
+
+    private static BigDecimal firstPositive(BigDecimal... values) {
+        for (BigDecimal value : values) {
+            if (value != null && value.signum() > 0) return value;
+        }
+        return null;
+    }
+
+    private static BigDecimal orderPrice(Taoli quote, boolean isLong) {
+        return isLong
+                ? firstPositive(quote.getLongAskPce(), quote.getLongLast(), quote.getLongMark())
+                : firstPositive(quote.getShortBidPce(), quote.getShortLast(), quote.getShortMark());
+    }
+
+    private static String formatContract(String coin, String exchange) {
+        String base = baseCoin(coin);
+        return switch (exchange) {
+            case "okx" -> base + "-USDT-SWAP";
+            case "binance", "bybit", "bitget" -> base + "USDT";
+            case "gate", "gateio" -> base + "_USDT";
+            default -> base;
+        };
+    }
+
+    private static String baseCoin(String coin) {
+        String value = required(coin, "coin").trim().toUpperCase(Locale.ROOT);
+        int colon = value.lastIndexOf(':');
+        if (colon >= 0 && colon + 1 < value.length()) {
+            value = value.substring(colon + 1);
+        }
+        for (String suffix : List.of("-USDT-SWAP", "-SWAP-USDT", "_USDT", "-USDT", "/USDT", "USDT")) {
+            if (value.length() > suffix.length() && value.endsWith(suffix)) {
+                return value.substring(0, value.length() - suffix.length());
+            }
+        }
+        return value;
+    }
+
+    private static boolean isIbkrFinalFailure(String status) {
+        return "cancelled".equalsIgnoreCase(status)
+                || "inactive".equalsIgnoreCase(status)
+                || "error".equalsIgnoreCase(status)
+                || "local_rejected".equalsIgnoreCase(status);
     }
 
     private String orderOkx(String coin, BigDecimal size, OrderRequest.ExchangeApi api, boolean isLong)
@@ -93,7 +303,6 @@ public class ExchangeOrderService {
         body.put("side", isLong ? "buy" : "sell");
         body.put("posSide", isLong ? "long" : "short");
         body.put("tdMode", "cross");
-        body.put("tag", "1311e341f73eSUDE");
         body.put("sz", size.stripTrailingZeros().toPlainString());
         String path = "/api/v5/trade/order";
         String requestBody = objectMapper.writeValueAsString(body);
@@ -104,7 +313,7 @@ public class ExchangeOrderService {
                         timestamp + "POST" + path + requestBody),
                 "OK-ACCESS-TIMESTAMP", timestamp,
                 "OK-ACCESS-PASSPHRASE", required(api.getAp(), "OKX passphrase")));
-        return requireSuccess(response, "OKX");
+        return requireOkxSuccess(response);
     }
 
     private String orderBinance(String coin, BigDecimal size, OrderRequest.ExchangeApi api, boolean isLong)
@@ -120,7 +329,7 @@ public class ExchangeOrderService {
         String query = query(params);
         String signedQuery = query + "&signature="
                 + hmacHex("HmacSHA256", required(api.getAc(), "Binance secretKey"), query);
-        HttpResponse<String> response = send("https://papi.binance.com/papi/v1/um/order?" + signedQuery,
+        HttpResponse<String> response = send("https://fapi.binance.com/fapi/v1/order?" + signedQuery,
                 "POST", "", Map.of("X-MBX-APIKEY", required(api.getAk(), "Binance apiKey")));
         return requireSuccess(response, "Binance");
     }
@@ -146,7 +355,7 @@ public class ExchangeOrderService {
                 "X-BAPI-API-KEY", key,
                 "X-BAPI-TIMESTAMP", timestamp,
                 "X-BAPI-RECV-WINDOW", window));
-        return requireSuccess(response, "Bybit");
+        return requireJsonCode(response, "Bybit", "retCode", "0");
     }
 
     private String orderBitget(String coin, BigDecimal size, OrderRequest.ExchangeApi api, boolean isLong)
@@ -171,7 +380,7 @@ public class ExchangeOrderService {
                 "ACCESS-TIMESTAMP", timestamp,
                 "ACCESS-PASSPHRASE", required(api.getAp(), "Bitget passphrase"),
                 "locale", "zh-CN"));
-        return requireSuccess(response, "Bitget");
+        return requireJsonCode(response, "Bitget", "code", "00000");
     }
 
     private String orderGate(String coin, BigDecimal size, OrderRequest.ExchangeApi api, boolean isLong)
@@ -223,6 +432,27 @@ public class ExchangeOrderService {
         return response.body();
     }
 
+    private String requireOkxSuccess(HttpResponse<String> response) throws Exception {
+        String body = requireSuccess(response, "OKX");
+        JsonNode result = objectMapper.readTree(body);
+        JsonNode data = result.get("data");
+        String subCode = data != null && data.size() > 0 ? text(data.get(0), "sCode") : "";
+        if (!"0".equals(text(result, "code")) || (!subCode.isBlank() && !"0".equals(subCode))) {
+            throw new IllegalStateException("OKX order rejected: " + body);
+        }
+        return body;
+    }
+
+    private String requireJsonCode(HttpResponse<String> response, String exchange,
+            String codeField, String successCode) throws Exception {
+        String body = requireSuccess(response, exchange);
+        JsonNode result = objectMapper.readTree(body);
+        if (!successCode.equals(text(result, codeField))) {
+            throw new IllegalStateException(exchange + " order rejected: " + body);
+        }
+        return body;
+    }
+
     private static String query(Map<String, String> params) {
         StringBuilder result = new StringBuilder();
         params.forEach((key, value) -> {
@@ -263,7 +493,8 @@ public class ExchangeOrderService {
 
     private static boolean blank(String value) { return value == null || value.isBlank(); }
 
-    private Map<String, Object> placeHyperliquidIfNeeded(OrderRequest request) throws Exception {
+    private Map<String, Object> placeHyperliquidIfNeeded(
+            OrderRequest request, BigDecimal baseQuantity) throws Exception {
         OrderRequest.ExchangeApi api = null;
         boolean isBuy = false;
         if (isHyperliquid(request.getShortApi())) {
@@ -284,9 +515,8 @@ public class ExchangeOrderService {
         }
 
         Asset asset = loadHyperliquidAsset(request.getCoin());
-        BigDecimal quantity = request.getTemplate().getUs().divide(asset.midPrice(), 18, RoundingMode.DOWN)
-                .setScale(asset.szDecimals(), RoundingMode.DOWN);
-        if (quantity.signum() <= 0) throw new IllegalArgumentException("template.us is too small");
+        BigDecimal quantity = baseQuantity.setScale(asset.szDecimals(), RoundingMode.DOWN);
+        if (quantity.signum() <= 0) throw new IllegalArgumentException("matched quantity is too small");
         BigDecimal marketPrice = asset.midPrice().multiply(isBuy
                 ? new BigDecimal("1.05") : new BigDecimal("0.95"));
         int priceDecimals = Math.max(0, 6 - asset.szDecimals());
@@ -322,8 +552,94 @@ public class ExchangeOrderService {
         if (!"ok".equalsIgnoreCase(text(result, "status"))) {
             throw new IllegalStateException("Hyperliquid order rejected: " + responseBody);
         }
+        JsonNode filled = result.get("response").get("data").get("statuses").get(0).get("filled");
+        if (filled == null || filled.isNull()) {
+            throw new IllegalStateException("Hyperliquid order was not filled: " + responseBody);
+        }
+        long orderId = filled.get("oid").asLong();
+        JsonNode orderStatus = queryHyperliquidOrder(api.getAk(), orderId);
+        saveHyperliquidPosition(request, isBuy, orderId, filled, orderStatus);
         return Map.of("exchange", "hyperliquid", "coin", request.getCoin(),
-                "side", isBuy ? "buy" : "sell", "quantity", size, "price", price, "response", result);
+                "side", isBuy ? "buy" : "sell", "quantity", size, "price", price,
+                "orderStatus", orderStatus, "response", result);
+    }
+
+    private JsonNode queryHyperliquidOrder(String accountAddress, long orderId) throws Exception {
+        String requestBody = objectMapper.writeValueAsString(Map.of(
+                "type", "orderStatus",
+                "user", accountAddress.trim(),
+                "oid", orderId));
+        JsonNode result = requestHyperliquidInfo(requestBody, System.currentTimeMillis());
+        JsonNode order = result.get("order");
+        String status = text(order, "status");
+        log.info("Hyperliquid order status: orderId={}, status={}", orderId, status);
+        if (!"order".equalsIgnoreCase(text(result, "status")) || !"filled".equalsIgnoreCase(status)) {
+            throw new IllegalStateException(
+                    "Hyperliquid order is not filled: orderId=" + orderId + ", response=" + result);
+        }
+        return result;
+    }
+
+    private void saveHyperliquidPosition(OrderRequest request, boolean isBuy, long orderId,
+            JsonNode filled, JsonNode orderStatus) throws Exception {
+        Integer userId = request.getTemplate() == null ? null : request.getTemplate().getUr();
+        if (userId == null) {
+            throw new IllegalArgumentException("template.ur is required");
+        }
+        BigDecimal fillPrice = new BigDecimal(text(filled, "avgPx"));
+        BigDecimal fillQuantity = new BigDecimal(text(filled, "totalSz"));
+        String side = isBuy ? "long" : "short";
+        String key = POSITION_KEY_PREFIX + userId;
+        OrderRequest.Position position = mergePosition(
+                key, userId, request.getCoin(), side, fillPrice, fillQuantity);
+        position.setOrderId(orderId);
+        position.setStatus(text(orderStatus.get("order"), "status"));
+        position.setUpdatedAt(System.currentTimeMillis());
+        request.setPosition(position);
+        stringRedisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(position));
+        log.info("Hyperliquid position saved: key={}, coin={}, side={}, openPrice={}, quantity={}, orderId={}",
+                key, position.getCoin(), position.getSide(), position.getOpenPrice(),
+                position.getQuantity(), orderId);
+    }
+
+    private OrderRequest.Position mergePosition(String key, Integer userId, String coin, String side,
+            BigDecimal fillPrice, BigDecimal fillQuantity) {
+        OrderRequest.Position current = readPosition(key);
+        if (current == null || !sameValue(current.getExchange(), "hyperliquid")
+                || !sameValue(current.getCoin(), coin) || !sameValue(current.getSide(), side)
+                || current.getOpenPrice() == null || current.getQuantity() == null
+                || current.getQuantity().signum() <= 0) {
+            return OrderRequest.Position.builder()
+                    .userId(userId)
+                    .exchange("hyperliquid")
+                    .coin(coin)
+                    .side(side)
+                    .openPrice(fillPrice)
+                    .quantity(fillQuantity)
+                    .build();
+        }
+        BigDecimal totalQuantity = current.getQuantity().add(fillQuantity);
+        BigDecimal totalValue = current.getOpenPrice().multiply(current.getQuantity())
+                .add(fillPrice.multiply(fillQuantity));
+        current.setOpenPrice(totalValue.divide(totalQuantity, 18, RoundingMode.HALF_UP)
+                .stripTrailingZeros());
+        current.setQuantity(totalQuantity.stripTrailingZeros());
+        return current;
+    }
+
+    private OrderRequest.Position readPosition(String key) {
+        String value = stringRedisTemplate.opsForValue().get(key);
+        if (blank(value)) return null;
+        try {
+            return objectMapper.readValue(value, OrderRequest.Position.class);
+        } catch (Exception e) {
+            log.warn("Failed to read existing position from {}; overwrite it", key, e);
+            return null;
+        }
+    }
+
+    private static boolean sameValue(String left, String right) {
+        return left != null && right != null && left.equalsIgnoreCase(right);
     }
 
     private Asset loadHyperliquidAsset(String requestedCoin) throws Exception {

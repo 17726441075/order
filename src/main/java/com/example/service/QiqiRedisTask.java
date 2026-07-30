@@ -26,7 +26,6 @@ import tools.jackson.databind.ObjectMapper;
 public class QiqiRedisTask {
     private static final String KEY = "qiqi";
     private static final String USERS_KEY = "qiqi:users";
-    private static final String POSITION_KEY_PREFIX = "qiqi:positon:";
 
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
@@ -214,8 +213,11 @@ public class QiqiRedisTask {
                     || position == null) {
                 return;
             }
-            stringRedisTemplate.opsForValue().set(POSITION_KEY_PREFIX + user.getTemplate().getUr(),
-                    objectMapper.writeValueAsString(position));
+            String key = PositionKey.of(user);
+            if (key == null) {
+                return;
+            }
+            stringRedisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(position));
         } catch (Exception e) {
             throw new IllegalStateException("Failed to update Redis position for user "
                     + (user.getTemplate() == null ? null : user.getTemplate().getUr()), e);
@@ -328,8 +330,11 @@ public class QiqiRedisTask {
         if (user.getTemplate() == null || user.getTemplate().getUr() == null) {
             return null;
         }
-        String value = stringRedisTemplate.opsForValue()
-                .get(POSITION_KEY_PREFIX + user.getTemplate().getUr());
+        String key = PositionKey.of(user);
+        if (key == null) {
+            return null;
+        }
+        String value = stringRedisTemplate.opsForValue().get(key);
         if (!StringUtils.hasText(value)) {
             return null;
         }

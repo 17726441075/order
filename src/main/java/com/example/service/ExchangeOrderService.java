@@ -24,7 +24,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -64,7 +63,6 @@ public class ExchangeOrderService {
     private static final long POSITION_QUERY_INITIAL_DELAY_MILLIS = 2_000L;
     private static final long POSITION_QUERY_INTERVAL_MILLIS = 2_000L;
     private static final long POSITION_QUERY_RETRY_MILLIS = 30_000L;
-    private static final String POSITION_KEY_PREFIX = "qiqi:positon:";
     private static final Set<String> POSITION_QUERY_EXCHANGES = Set.of(
             "okx", "binance", "bybit", "bitget", "gate", "gateio", "hyper", "hyperliquid");
     private final ObjectMapper objectMapper;
@@ -188,7 +186,7 @@ public class ExchangeOrderService {
 
     private String orderIbkr(OrderRequest request, BigDecimal baseQuantity, boolean isLong,
             boolean close) throws Exception {
-        String requestId = createIbkrRequestId(request, isLong, close);
+        String requestId = createIbkrRequestId();
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("requestId", requestId);
         body.put("coin", request.getCoin());
@@ -199,7 +197,10 @@ public class ExchangeOrderService {
         String requestBody = objectMapper.writeValueAsString(body);
         Map<String, String> headers = Map.of(
                 "X-Taoli-Api-Key", required(ibkrApiKey, "IBKR downstream apiKey"));
-        HttpResponse<String> response = send(ibkrUrl("/api/ibkr/orders/market"),
+        String url = ibkrUrl("/api/ibkr/orders/market");
+        log.info("IBKR order request: method=POST, url={}, headers={{X-Taoli-Api-Key={}}}, body={}",
+                url, maskSecret(headers.get("X-Taoli-Api-Key")), requestBody);
+        HttpResponse<String> response = send(url,
                 "POST", requestBody, headers);
         String responseBody = requireSuccess(response, "IBKR");
         JsonNode order = objectMapper.readTree(responseBody);
@@ -282,10 +283,64 @@ public class ExchangeOrderService {
                 .divide(commonStep, 0, RoundingMode.DOWN)
                 .multiply(commonStep)
                 .stripTrailingZeros();
+        BigDecimal ibkrQuantity = calculateIbkrIntegerQuantity(
+                request, notional, longPrice, shortPrice, longMaximum, shortMaximum);
+        if (ibkrQuantity != null) {
+            quantity = ibkrQuantity;
+        }
         if (quantity.signum() <= 0) {
             throw new IllegalArgumentException("order amount is below the common minimum quantity");
         }
         return quantity;
+    }
+
+    private BigDecimal calculateIbkrIntegerQuantity(OrderRequest request, BigDecimal notional,
+            BigDecimal longPrice, BigDecimal shortPrice, BigDecimal longMaximum,
+            BigDecimal shortMaximum) {
+        boolean ibkrLong = isIbkr(request.getLongApi());
+        boolean ibkrShort = isIbkr(request.getShortApi());
+        if (!ibkrLong && !ibkrShort) {
+            return null;
+        }
+
+        BigDecimal quantity = null;
+        if (ibkrLong) {
+            quantity = roundIbkrQuantity(notional, longPrice);
+        }
+        if (ibkrShort) {
+            BigDecimal shortQuantity = roundIbkrQuantity(notional, shortPrice);
+            quantity = quantity == null ? shortQuantity : quantity.max(shortQuantity);
+        }
+
+        if (ibkrLong) {
+            validateIbkrIntegerAmount(request, notional, longPrice, quantity, "long");
+        }
+        if (ibkrShort) {
+            validateIbkrIntegerAmount(request, notional, shortPrice, quantity, "short");
+        }
+        if (quantity.compareTo(longMaximum) > 0 || quantity.compareTo(shortMaximum) > 0) {
+            log.error("IBKR integer quantity exceeds single order amount: coin={}, amount={}, quantity={}, "
+                    + "longPrice={}, shortPrice={}, longMaximum={}, shortMaximum={}",
+                    request.getCoin(), notional, quantity, longPrice, shortPrice,
+                    longMaximum, shortMaximum);
+            throw new IllegalArgumentException("IBKR integer share quantity exceeds single order amount");
+        }
+        return quantity.stripTrailingZeros();
+    }
+
+    private static BigDecimal roundIbkrQuantity(BigDecimal notional, BigDecimal price) {
+        return notional.divide(price, 0, RoundingMode.DOWN).max(BigDecimal.ONE);
+    }
+
+    private void validateIbkrIntegerAmount(OrderRequest request, BigDecimal notional,
+            BigDecimal price, BigDecimal quantity, String side) {
+        BigDecimal requiredAmount = price.multiply(quantity);
+        if (requiredAmount.compareTo(notional) > 0) {
+            log.error("IBKR integer quantity exceeds single order amount: coin={}, side={}, amount={}, "
+                    + "price={}, quantity={}, requiredAmount={}",
+                    request.getCoin(), side, notional, price, quantity, requiredAmount);
+            throw new IllegalArgumentException("IBKR integer share quantity exceeds single order amount");
+        }
     }
 
     private BigDecimal baseQuantityStep(String coin, OrderRequest.ExchangeApi api, Taoli quote, boolean isLong)
@@ -375,7 +430,10 @@ public class ExchangeOrderService {
             throw new IllegalStateException("Position query is not supported for this exchange pair");
         }
 
-        String key = POSITION_KEY_PREFIX + request.getTemplate().getUr();
+        String key = PositionKey.of(request);
+        if (key == null) {
+            throw new IllegalArgumentException("position key cannot be created");
+        }
         Position position = currentPosition(key);
         position.setUserId(request.getTemplate().getUr());
         position.setCoin(request.getCoin());
@@ -389,7 +447,24 @@ public class ExchangeOrderService {
             position.setShortOpenPrice(shortPosition.openPrice());
             position.setShortQuantity(shortPosition.quantity());
         }
+        if (isOpeningWithoutObservedPosition(position, longPosition, shortPosition)) {
+            position.setUpdatedAt(System.currentTimeMillis());
+            stringRedisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(position));
+            return;
+        }
         savePosition(key, position);
+    }
+
+    private static boolean isOpeningWithoutObservedPosition(Position position,
+            LegPosition longPosition, LegPosition shortPosition) {
+        return position != null
+                && "OPENING".equalsIgnoreCase(position.getStatus())
+                && !hasObservedQuantity(longPosition)
+                && !hasObservedQuantity(shortPosition);
+    }
+
+    private static boolean hasObservedQuantity(LegPosition position) {
+        return position != null && position.quantity() != null && position.quantity().signum() > 0;
     }
 
     private LegPosition loadExchangePosition(String coin, OrderRequest.ExchangeApi api,
@@ -424,7 +499,7 @@ public class ExchangeOrderService {
                 || request.getTemplate().getUr() == null || blank(request.getCoin())) {
             return null;
         }
-        return request.getTemplate().getUr() + "|" + request.getCoin().trim().toUpperCase(Locale.ROOT);
+        return PositionKey.of(request);
     }
 
     @PreDestroy
@@ -639,7 +714,8 @@ public class ExchangeOrderService {
         }
         Integer userId = request.getTemplate() == null ? null : request.getTemplate().getUr();
         if (userId == null) throw new IllegalArgumentException("template.ur is required");
-        String key = POSITION_KEY_PREFIX + userId;
+        String key = PositionKey.of(request);
+        if (key == null) throw new IllegalArgumentException("position key cannot be created");
         Position position = currentPosition(key);
         position.setUserId(userId);
         position.setCoin(request.getCoin());
@@ -671,7 +747,8 @@ public class ExchangeOrderService {
         }
         Integer userId = request.getTemplate() == null ? null : request.getTemplate().getUr();
         if (userId == null) throw new IllegalArgumentException("template.ur is required");
-        String key = POSITION_KEY_PREFIX + userId;
+        String key = PositionKey.of(request);
+        if (key == null) throw new IllegalArgumentException("position key cannot be created");
         Position position = currentPosition(key);
         BigDecimal currentQuantity = isLong
                 ? zeroIfNull(position.getLongQuantity())
@@ -721,14 +798,8 @@ public class ExchangeOrderService {
         return value.isBlank() ? BigDecimal.ZERO : new BigDecimal(value);
     }
 
-    private String createIbkrRequestId(OrderRequest request, boolean isLong, boolean close) {
-        String side = close ? (isLong ? "SELL" : "BUY") : (isLong ? "BUY" : "SELL");
-        Position position = readPosition(
-                POSITION_KEY_PREFIX + request.getTemplate().getUr());
-        String logicalOrder = request.getTemplate().getUr() + "|" + request.getCoin() + "|"
-                + (close ? "CLOSE|" : "OPEN|") + side + "|" + openedAmount(position) + "|"
-                + (close ? positionUpdatedAt(position) : request.getTemplate().getUs());
-        return "qiqi-" + UUID.nameUUIDFromBytes(logicalOrder.getBytes(StandardCharsets.UTF_8));
+    private static String createIbkrRequestId() {
+        return "qiqi-" + System.currentTimeMillis();
     }
 
     private String ibkrUrl(String path) {
@@ -744,15 +815,6 @@ public class ExchangeOrderService {
 
     private static BigDecimal zeroIfNull(BigDecimal value) {
         return value == null ? BigDecimal.ZERO : value;
-    }
-
-    private static BigDecimal openedAmount(Position position) {
-        return position == null || position.getOpenedAmount() == null
-                ? BigDecimal.ZERO : position.getOpenedAmount();
-    }
-
-    private static long positionUpdatedAt(Position position) {
-        return position == null || position.getUpdatedAt() == null ? 0L : position.getUpdatedAt();
     }
 
     private static BigDecimal orderPrice(Taoli quote, boolean isLong) {
@@ -1007,6 +1069,12 @@ public class ExchangeOrderService {
 
     private static boolean blank(String value) { return value == null || value.isBlank(); }
 
+    private static String maskSecret(String value) {
+        if (blank(value)) return "";
+        if (value.length() <= 8) return "****";
+        return value.substring(0, 4) + "****" + value.substring(value.length() - 4);
+    }
+
     private Map<String, Object> placeHyperliquidIfNeeded(
             OrderRequest request, BigDecimal baseQuantity) throws Exception {
         OrderRequest.ExchangeApi api = null;
@@ -1110,7 +1178,8 @@ public class ExchangeOrderService {
         }
         BigDecimal fillPrice = new BigDecimal(text(filled, "avgPx"));
         BigDecimal fillQuantity = new BigDecimal(text(filled, "totalSz"));
-        String key = POSITION_KEY_PREFIX + userId;
+        String key = PositionKey.of(request);
+        if (key == null) throw new IllegalArgumentException("position key cannot be created");
         Position position = currentPosition(key);
         position.setUserId(userId);
         position.setCoin(request.getCoin());
@@ -1240,6 +1309,10 @@ public class ExchangeOrderService {
     private static boolean isHyperliquid(OrderRequest.ExchangeApi api) {
         return api != null && ("hyperliquid".equalsIgnoreCase(api.getEe())
                 || "hyper".equalsIgnoreCase(api.getEe()));
+    }
+
+    private static boolean isIbkr(OrderRequest.ExchangeApi api) {
+        return api != null && api.getEe() != null && "ibkr".equalsIgnoreCase(api.getEe().trim());
     }
 
     private Signature signHyperliquidAction(String privateKey, LinkedHashMap<String, Object> action,

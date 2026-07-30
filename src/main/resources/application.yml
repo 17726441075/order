@@ -12,4 +12,4 @@ spring:
       database: 0
 ibkr:
   base-url: ${IBKR_BASE_URL:http://8.211.150.14:8082}
-  api-key: ${IBKR_API_KEY:}
+  api-key: ecaff9bade376ad512d8ba74880fe64ad03bfe3478ad12801ec0d346dffc02bf

@@ -16,6 +16,7 @@ import org.springframework.util.StringUtils;
 
 import com.example.entity.Taoli;
 import com.example.entity.OrderRequest;
+import com.example.entity.Position;
 
 import tools.jackson.databind.ObjectMapper;
 
@@ -25,6 +26,7 @@ import tools.jackson.databind.ObjectMapper;
 public class QiqiRedisTask {
     private static final String KEY = "qiqi";
     private static final String USERS_KEY = "qiqi:users";
+    private static final String POSITION_KEY_PREFIX = "qiqi:positon:";
 
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
@@ -59,10 +61,9 @@ public class QiqiRedisTask {
             return;
         }
         try {
-            for (int index = 0; index < usersList.size(); index++) {
-                OrderRequest user = usersList.get(index);
+            for (OrderRequest user : usersList) {
                 try {
-                    tryOpenForUser(index, user);
+                    tryOpenForUser(user);
                 } catch (Exception e) {
                     log.error("Arbitrage user processing failed: userId={}, coin={}; continue with next user",
                             user == null || user.getTemplate() == null ? null : user.getTemplate().getUr(),
@@ -74,7 +75,7 @@ public class QiqiRedisTask {
         }
     }
 
-    private void tryOpenForUser(int userIndex, OrderRequest user) {
+    private void tryOpenForUser(OrderRequest user) {
         if (user == null || user.getTemplate() == null || !StringUtils.hasText(user.getCoin())) {
             return;
         }
@@ -88,19 +89,34 @@ public class QiqiRedisTask {
             return;
         }
 
-        BigDecimal openedAmount = template.getTa2() == null ? BigDecimal.ZERO : template.getTa2();
-        OrderRequest.Position position = user.getPosition();
+        Position position = loadRuntimePosition(user);
+        BigDecimal openedAmount = openedAmount(position);
+        if (position != null && position.getOpenedAmount() == null && template.getTa2() != null) {
+            position.setOpenedAmount(template.getTa2());
+            openedAmount = position.getOpenedAmount();
+            persistPosition(user, position);
+        } else if (position == null && template.getTa2() != null) {
+            openedAmount = template.getTa2();
+            // 兼容旧数据：旧版 ta2 仅用于等待一次仓位同步，之后不再读取或回写模板。
+            openedAmount = template.getTa2();
+        }
         if (isPending(position)) {
             exchangeOrderService.refreshPositionAsync(user, quote);
             return;
         }
 
-        if (isClosed(position) && openedAmount.signum() > 0) {
-            template.setTa2(BigDecimal.ZERO);
-            persistUser(userIndex, user);
-            log.info("Arbitrage position closed: userId={}, coin={}, ta2=0",
-                    template.getUr(), user.getCoin());
-            return;
+        if (isClosed(position)) {
+            if (openedAmount.signum() > 0) {
+                position.setOpenedAmount(BigDecimal.ZERO);
+                openedAmount = BigDecimal.ZERO;
+                log.info("Arbitrage position closed: userId={}, coin={}, openedAmount=0",
+                        template.getUr(), user.getCoin());
+            }
+            if (!canReopenAfterClose(template, quote)) {
+                persistPosition(user, position);
+                return;
+            }
+            position = null;
         }
 
         if (openedAmount.signum() > 0 && position == null) {
@@ -109,7 +125,15 @@ public class QiqiRedisTask {
         }
 
         if (hasOpenPosition(position) && shouldClose(template, quote)) {
-            closePosition(userIndex, user, quote);
+            closePosition(user, position, quote);
+            return;
+        }
+
+        if (template.getSl() != null && quote.getCloseCha() == null) {
+            return;
+        }
+
+        if (shouldClose(template, quote)) {
             return;
         }
 
@@ -133,41 +157,34 @@ public class QiqiRedisTask {
         }
 
         BigDecimal orderAmount = template.getUs().min(remainingAmount);
-        BigDecimal originalAmount = template.getUs();
-        markPositionStatus(user, "OPENING");
-        persistUser(userIndex, user);
-        template.setUs(orderAmount);
+        position = markPositionStatus(user, position, "OPENING");
+        persistPosition(user, position);
         log.info("Arbitrage open before: userId={}, coin={}, longExchange={}, shortExchange={}, openCha={}, "
-                        + "netFundingRate={}, amount={}, ta2={}, target={}",
+                        + "netFundingRate={}, amount={}, openedAmount={}, target={}",
                 template.getUr(), user.getCoin(),
                 user.getLongApi() == null ? null : user.getLongApi().getEe(),
                 user.getShortApi() == null ? null : user.getShortApi().getEe(),
                 quote.getOpenCha(), quote.getAllFee(), orderAmount, openedAmount, template.getTa());
         try {
-            exchangeOrderService.placeOpenOrders(user, quote);
-            template.setTa2(openedAmount.add(orderAmount));
-            template.setUs(originalAmount);
-            markPositionStatus(user, "OPENING");
-            persistUser(userIndex, user);
-            log.info("Arbitrage open after: userId={}, coin={}, amount={}, ta2={}",
-                    template.getUr(), user.getCoin(), orderAmount, template.getTa2());
+            exchangeOrderService.placeOpenOrders(user, quote, orderAmount);
+            position.setOpenedAmount(openedAmount.add(orderAmount));
+            position = markPositionStatus(user, position, "OPENING");
+            persistPosition(user, position);
+            log.info("Arbitrage open after: userId={}, coin={}, amount={}, openedAmount={}",
+                    template.getUr(), user.getCoin(), orderAmount, position.getOpenedAmount());
         } catch (Exception e) {
-            template.setUs(originalAmount);
-            markPositionStatus(user, "OPENING");
-            persistUser(userIndex, user);
+            position = markPositionStatus(user, position, "OPENING");
+            persistPosition(user, position);
             exchangeOrderService.refreshPositionAsync(user, quote);
             log.error("Arbitrage open failed: userId={}, coin={}, amount={}",
                     template.getUr(), user.getCoin(), orderAmount, e);
-        } finally {
-            template.setUs(originalAmount);
         }
     }
 
-    private void closePosition(int userIndex, OrderRequest user, Taoli quote) {
+    private void closePosition(OrderRequest user, Position position, Taoli quote) {
         OrderRequest.OrderTemplate template = user.getTemplate();
-        OrderRequest.Position position = user.getPosition();
-        markPositionStatus(user, "CLOSING");
-        persistUser(userIndex, user);
+        position = markPositionStatus(user, position, "CLOSING");
+        persistPosition(user, position);
         log.info("Arbitrage close before: userId={}, coin={}, longExchange={}, shortExchange={}, "
                         + "closeCha={}, closeTarget={}, longQuantity={}, shortQuantity={}",
                 template.getUr(), user.getCoin(),
@@ -176,34 +193,39 @@ public class QiqiRedisTask {
                 quote.getCloseCha(), template.getSl(),
                 position.getLongQuantity(), position.getShortQuantity());
         try {
-            exchangeOrderService.placeCloseOrders(user, quote);
-            markPositionStatus(user, "CLOSING");
-            persistUser(userIndex, user);
+            exchangeOrderService.placeCloseOrders(user, position, quote);
+            position = markPositionStatus(user, position, "CLOSING");
+            persistPosition(user, position);
             log.info("Arbitrage close submitted: userId={}, coin={}, longQuantity={}, shortQuantity={}",
                     template.getUr(), user.getCoin(),
                     position.getLongQuantity(), position.getShortQuantity());
         } catch (Exception e) {
-            markPositionStatus(user, "CLOSING");
-            persistUser(userIndex, user);
+            position = markPositionStatus(user, position, "CLOSING");
+            persistPosition(user, position);
             exchangeOrderService.refreshPositionAsync(user, quote);
             log.error("Arbitrage close failed: userId={}, coin={}",
                     template.getUr(), user.getCoin(), e);
         }
     }
 
-    private void persistUser(int userIndex, OrderRequest user) {
+    private void persistPosition(OrderRequest user, Position position) {
         try {
-            stringRedisTemplate.opsForList().set(
-                    USERS_KEY, userIndex, objectMapper.writeValueAsString(user));
+            if (user.getTemplate() == null || user.getTemplate().getUr() == null
+                    || position == null) {
+                return;
+            }
+            stringRedisTemplate.opsForValue().set(POSITION_KEY_PREFIX + user.getTemplate().getUr(),
+                    objectMapper.writeValueAsString(position));
         } catch (Exception e) {
-            throw new IllegalStateException("Failed to update Redis user at index " + userIndex, e);
+            throw new IllegalStateException("Failed to update Redis position for user "
+                    + (user.getTemplate() == null ? null : user.getTemplate().getUr()), e);
         }
     }
 
-    private static void markPositionStatus(OrderRequest user, String status) {
-        OrderRequest.Position position = user.getPosition();
+    private static Position markPositionStatus(OrderRequest user,
+            Position position, String status) {
         if (position == null) {
-            position = new OrderRequest.Position();
+            position = new Position();
             position.setUserId(user.getTemplate().getUr());
             position.setCoin(user.getCoin());
             position.setLongExchange(user.getLongApi() == null ? null : user.getLongApi().getEe());
@@ -211,10 +233,11 @@ public class QiqiRedisTask {
             position.setLongQuantity(BigDecimal.ZERO);
             position.setShortQuantity(BigDecimal.ZERO);
             position.setMatchedQuantity(BigDecimal.ZERO);
-            user.setPosition(position);
+            position.setOpenedAmount(BigDecimal.ZERO);
         }
         position.setStatus(status);
         position.setUpdatedAt(System.currentTimeMillis());
+        return position;
     }
 
     private static boolean shouldClose(OrderRequest.OrderTemplate template, Taoli quote) {
@@ -222,27 +245,37 @@ public class QiqiRedisTask {
                 && quote.getCloseCha().compareTo(template.getSl()) <= 0;
     }
 
-    private static boolean hasOpenPosition(OrderRequest.Position position) {
+    private static boolean canReopenAfterClose(OrderRequest.OrderTemplate template, Taoli quote) {
+        return template.getSl() == null || (quote.getCloseCha() != null
+                && quote.getCloseCha().compareTo(template.getSl()) > 0);
+    }
+
+    private static boolean hasOpenPosition(Position position) {
         return position != null
                 && (isPositive(position.getLongQuantity()) || isPositive(position.getShortQuantity()));
     }
 
-    private static boolean isMatched(OrderRequest.Position position) {
+    private static boolean isMatched(Position position) {
         return position != null && "MATCHED".equalsIgnoreCase(position.getStatus());
     }
 
-    private static boolean isPending(OrderRequest.Position position) {
+    private static boolean isPending(Position position) {
         return position != null && ("OPENING".equalsIgnoreCase(position.getStatus())
                 || "CLOSING".equalsIgnoreCase(position.getStatus()));
     }
 
-    private static boolean isClosed(OrderRequest.Position position) {
+    private static boolean isClosed(Position position) {
         return position != null && "CLOSED".equalsIgnoreCase(position.getStatus())
                 && !hasOpenPosition(position);
     }
 
     private static boolean isPositive(BigDecimal value) {
         return value != null && value.signum() > 0;
+    }
+
+    private static BigDecimal openedAmount(Position position) {
+        return position == null || position.getOpenedAmount() == null
+                ? BigDecimal.ZERO : position.getOpenedAmount();
     }
 
     private Taoli findQuote(OrderRequest user) {
@@ -289,6 +322,27 @@ public class QiqiRedisTask {
             }
         }
         return result;
+    }
+
+    private Position loadRuntimePosition(OrderRequest user) {
+        if (user.getTemplate() == null || user.getTemplate().getUr() == null) {
+            return null;
+        }
+        String value = stringRedisTemplate.opsForValue()
+                .get(POSITION_KEY_PREFIX + user.getTemplate().getUr());
+        if (!StringUtils.hasText(value)) {
+            return null;
+        }
+        try {
+            Position position = objectMapper.readValue(value, Position.class);
+            if (same(position.getCoin(), user.getCoin())) {
+                return position;
+            }
+        } catch (Exception e) {
+            log.warn("Failed to read Redis position for user {}; ignore position",
+                    user.getTemplate().getUr(), e);
+        }
+        return null;
     }
 
     private OrderRequest readUser(String value) throws Exception {

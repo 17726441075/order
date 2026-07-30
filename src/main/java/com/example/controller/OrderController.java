@@ -24,12 +24,12 @@ public class OrderController {
 
     @PostMapping("/order")
     public ResponseEntity<Map<String, Object>> order(@RequestBody(required = false) OrderRequest request) {
-        log.info("order request received: {}", request);
         if (request == null) {
             return ResponseEntity.badRequest().body(Map.of(
                     "success", false,
                     "message", "request JSON cannot be empty"));
         }
+        log.info("order request received: {}", request);
 
         try {
             stringRedisTemplate.opsForList().rightPush(USERS_KEY, objectMapper.writeValueAsString(request));
@@ -44,4 +44,5 @@ public class OrderController {
                 "success", true,
                 "message", "order request received"));
     }
+
 }

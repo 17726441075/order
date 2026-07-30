@@ -45,6 +45,7 @@ import org.web3j.crypto.Sign;
 import org.web3j.utils.Numeric;
 
 import com.example.entity.OrderRequest;
+import com.example.entity.Position;
 import com.example.entity.Taoli;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -64,7 +65,6 @@ public class ExchangeOrderService {
     private static final long POSITION_QUERY_INTERVAL_MILLIS = 2_000L;
     private static final long POSITION_QUERY_RETRY_MILLIS = 30_000L;
     private static final String POSITION_KEY_PREFIX = "qiqi:positon:";
-    private static final String USERS_KEY = "qiqi:users";
     private static final Set<String> POSITION_QUERY_EXCHANGES = Set.of(
             "okx", "binance", "bybit", "bitget", "gate", "gateio", "hyper", "hyperliquid");
     private final ObjectMapper objectMapper;
@@ -87,12 +87,13 @@ public class ExchangeOrderService {
     @Value("${ibkr.api-key}")
     private String ibkrApiKey;
 
-    public Map<String, Object> placeOpenOrders(OrderRequest request, Taoli quote) throws Exception {
-        if (request == null || request.getTemplate() == null || request.getTemplate().getUs() == null
-                || request.getTemplate().getUs().signum() <= 0) {
-            throw new IllegalArgumentException("template.us must be greater than 0");
+    public Map<String, Object> placeOpenOrders(OrderRequest request, Taoli quote, BigDecimal orderAmount)
+            throws Exception {
+        if (request == null || request.getTemplate() == null || orderAmount == null
+                || orderAmount.signum() <= 0) {
+            throw new IllegalArgumentException("orderAmount must be greater than 0");
         }
-        BigDecimal baseQuantity = calculateMatchedBaseQuantity(request, quote);
+        BigDecimal baseQuantity = calculateMatchedBaseQuantity(request, quote, orderAmount);
         Map<String, Object> result = new LinkedHashMap<>();
         try {
             placeLeg(request, quote, baseQuantity, request.getLongApi(), true, result);
@@ -107,17 +108,18 @@ public class ExchangeOrderService {
         }
     }
 
-    public Map<String, Object> placeCloseOrders(OrderRequest request, Taoli quote) throws Exception {
-        if (request == null || request.getPosition() == null) {
+    public Map<String, Object> placeCloseOrders(OrderRequest request, Position position,
+            Taoli quote) throws Exception {
+        if (request == null || position == null) {
             throw new IllegalArgumentException("position is required");
         }
         Map<String, Object> result = new LinkedHashMap<>();
         List<Exception> failures = new ArrayList<>();
         try {
             closeLeg(request, quote, request.getLongApi(), true,
-                    request.getPosition().getLongQuantity(), result, failures);
+                    position.getLongQuantity(), result, failures);
             closeLeg(request, quote, request.getShortApi(), false,
-                    request.getPosition().getShortQuantity(), result, failures);
+                    position.getShortQuantity(), result, failures);
         } finally {
             refreshPositionAsync(request, quote);
         }
@@ -261,7 +263,8 @@ public class ExchangeOrderService {
         return size;
     }
 
-    private BigDecimal calculateMatchedBaseQuantity(OrderRequest request, Taoli quote) throws Exception {
+    private BigDecimal calculateMatchedBaseQuantity(OrderRequest request, Taoli quote, BigDecimal notional)
+            throws Exception {
         if (quote == null) {
             throw new IllegalArgumentException("arbitrage quote is required");
         }
@@ -270,7 +273,6 @@ public class ExchangeOrderService {
         if (longPrice == null || shortPrice == null) {
             throw new IllegalArgumentException("arbitrage order price is unavailable");
         }
-        BigDecimal notional = request.getTemplate().getUs();
         BigDecimal longMaximum = notional.divide(longPrice, 18, RoundingMode.DOWN);
         BigDecimal shortMaximum = notional.divide(shortPrice, 18, RoundingMode.DOWN);
         BigDecimal commonStep = commonQuantityStep(
@@ -283,9 +285,6 @@ public class ExchangeOrderService {
         if (quantity.signum() <= 0) {
             throw new IllegalArgumentException("order amount is below the common minimum quantity");
         }
-        log.info("Matched order quantity: coin={}, quantity={}, longBudget={}, shortBudget={}, step={}",
-                request.getCoin(), quantity, quantity.multiply(longPrice),
-                quantity.multiply(shortPrice), commonStep);
         return quantity;
     }
 
@@ -350,7 +349,6 @@ public class ExchangeOrderService {
         try {
             Thread.sleep(POSITION_QUERY_INITIAL_DELAY_MILLIS);
             refreshPosition(request, quote);
-            syncPositionToUserList(request);
             positionQueryRetryAt.remove(queryKey);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -378,7 +376,7 @@ public class ExchangeOrderService {
         }
 
         String key = POSITION_KEY_PREFIX + request.getTemplate().getUr();
-        OrderRequest.Position position = currentPosition(request, key);
+        Position position = currentPosition(key);
         position.setUserId(request.getTemplate().getUr());
         position.setCoin(request.getCoin());
         if (longPosition != null) {
@@ -391,7 +389,7 @@ public class ExchangeOrderService {
             position.setShortOpenPrice(shortPosition.openPrice());
             position.setShortQuantity(shortPosition.quantity());
         }
-        savePosition(request, key, position);
+        savePosition(key, position);
     }
 
     private LegPosition loadExchangePosition(String coin, OrderRequest.ExchangeApi api,
@@ -418,36 +416,6 @@ public class ExchangeOrderService {
                 Thread.sleep(waitMillis);
             }
             nextPositionQueryAt = System.currentTimeMillis() + POSITION_QUERY_INTERVAL_MILLIS;
-        }
-    }
-
-    private void syncPositionToUserList(OrderRequest request) throws Exception {
-        Integer userId = request.getTemplate().getUr();
-        List<String> users = stringRedisTemplate.opsForList().range(USERS_KEY, 0, -1);
-        if (users == null) return;
-        for (int index = 0; index < users.size(); index++) {
-            OrderRequest stored;
-            try {
-                stored = objectMapper.readValue(users.get(index), OrderRequest.class);
-            } catch (Exception firstError) {
-                try {
-                    stored = objectMapper.readValue(
-                            users.get(index).replace("\r", "").replace("\n", ""),
-                            OrderRequest.class);
-                } catch (Exception secondError) {
-                    log.warn("Failed to parse Redis user at index {}; skip position sync", index);
-                    continue;
-                }
-            }
-            if (stored.getTemplate() == null || !userId.equals(stored.getTemplate().getUr())) {
-                continue;
-            }
-            stored.setPosition(request.getPosition());
-            stringRedisTemplate.opsForList().set(
-                    USERS_KEY, index, objectMapper.writeValueAsString(stored));
-            log.info("User position synchronized: userId={}, coin={}, status={}",
-                    userId, request.getCoin(), request.getPosition().getStatus());
-            return;
         }
     }
 
@@ -672,7 +640,7 @@ public class ExchangeOrderService {
         Integer userId = request.getTemplate() == null ? null : request.getTemplate().getUr();
         if (userId == null) throw new IllegalArgumentException("template.ur is required");
         String key = POSITION_KEY_PREFIX + userId;
-        OrderRequest.Position position = currentPosition(request, key);
+        Position position = currentPosition(key);
         position.setUserId(userId);
         position.setCoin(request.getCoin());
         if (isLong) {
@@ -686,7 +654,7 @@ public class ExchangeOrderService {
                     position.getShortOpenPrice(), position.getShortQuantity(), fillPrice, fillQuantity));
             position.setShortQuantity(sum(position.getShortQuantity(), fillQuantity));
         }
-        savePosition(request, key, position);
+        savePosition(key, position);
         log.info("IBKR position updated: key={}, requestId={}, coin={}, side={}, "
                         + "fillPrice={}, fillQuantity={}",
                 key, requestId, request.getCoin(), isLong ? "long" : "short",
@@ -704,7 +672,7 @@ public class ExchangeOrderService {
         Integer userId = request.getTemplate() == null ? null : request.getTemplate().getUr();
         if (userId == null) throw new IllegalArgumentException("template.ur is required");
         String key = POSITION_KEY_PREFIX + userId;
-        OrderRequest.Position position = currentPosition(request, key);
+        Position position = currentPosition(key);
         BigDecimal currentQuantity = isLong
                 ? zeroIfNull(position.getLongQuantity())
                 : zeroIfNull(position.getShortQuantity());
@@ -717,15 +685,14 @@ public class ExchangeOrderService {
             position.setShortQuantity(remainingQuantity);
             if (remainingQuantity.signum() == 0) position.setShortOpenPrice(BigDecimal.ZERO);
         }
-        savePosition(request, key, position);
+        savePosition(key, position);
         log.info("IBKR position reduced: key={}, requestId={}, coin={}, side={}, "
                         + "fillQuantity={}, remainingQuantity={}",
                 key, requestId, request.getCoin(), isLong ? "long" : "short",
                 fillQuantity, remainingQuantity);
     }
 
-    private void savePosition(OrderRequest request, String key, OrderRequest.Position position)
-            throws Exception {
+    private void savePosition(String key, Position position) throws Exception {
         BigDecimal longQuantity = position.getLongQuantity();
         BigDecimal shortQuantity = position.getShortQuantity();
         if (longQuantity != null && shortQuantity != null) {
@@ -739,16 +706,14 @@ public class ExchangeOrderService {
             position.setStatus("PARTIAL");
         }
         position.setUpdatedAt(System.currentTimeMillis());
-        request.setPosition(position);
         stringRedisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(position));
         log.info("Arbitrage position saved: key={}, coin={}, longQuantity={}, shortQuantity={}, status={}",
                 key, position.getCoin(), longQuantity, shortQuantity, position.getStatus());
     }
 
-    private OrderRequest.Position currentPosition(OrderRequest request, String key) {
-        if (request.getPosition() != null) return request.getPosition();
-        OrderRequest.Position stored = readPosition(key);
-        return stored == null ? new OrderRequest.Position() : stored;
+    private Position currentPosition(String key) {
+        Position stored = readPosition(key);
+        return stored == null ? new Position() : stored;
     }
 
     private static BigDecimal decimal(JsonNode node, String name) {
@@ -758,9 +723,11 @@ public class ExchangeOrderService {
 
     private String createIbkrRequestId(OrderRequest request, boolean isLong, boolean close) {
         String side = close ? (isLong ? "SELL" : "BUY") : (isLong ? "BUY" : "SELL");
+        Position position = readPosition(
+                POSITION_KEY_PREFIX + request.getTemplate().getUr());
         String logicalOrder = request.getTemplate().getUr() + "|" + request.getCoin() + "|"
-                + (close ? "CLOSE|" : "OPEN|") + side + "|" + request.getTemplate().getTa2() + "|"
-                + (close ? request.getPosition().getUpdatedAt() : request.getTemplate().getUs());
+                + (close ? "CLOSE|" : "OPEN|") + side + "|" + openedAmount(position) + "|"
+                + (close ? positionUpdatedAt(position) : request.getTemplate().getUs());
         return "qiqi-" + UUID.nameUUIDFromBytes(logicalOrder.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -777,6 +744,15 @@ public class ExchangeOrderService {
 
     private static BigDecimal zeroIfNull(BigDecimal value) {
         return value == null ? BigDecimal.ZERO : value;
+    }
+
+    private static BigDecimal openedAmount(Position position) {
+        return position == null || position.getOpenedAmount() == null
+                ? BigDecimal.ZERO : position.getOpenedAmount();
+    }
+
+    private static long positionUpdatedAt(Position position) {
+        return position == null || position.getUpdatedAt() == null ? 0L : position.getUpdatedAt();
     }
 
     private static BigDecimal orderPrice(Taoli quote, boolean isLong) {
@@ -945,11 +921,8 @@ public class ExchangeOrderService {
 
     private HttpResponse<String> send(String url, String method, String body, Map<String, String> headers)
             throws Exception {
-        boolean orderRequest = url.contains("/order") || url.contains("/close-position")
+        boolean orderOperation = url.contains("/order") || url.contains("/close-position")
                 || url.endsWith("/exchange");
-        if (orderRequest) {
-            log.info("Order request: method={}, url={}, body={}", method, url, body);
-        }
         HttpRequest.Builder builder = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(10));
         headers.forEach(builder::header);
         if ("POST".equals(method)) {
@@ -960,7 +933,7 @@ public class ExchangeOrderService {
         }
         HttpResponse<String> response = HTTP_CLIENT.send(builder.build(),
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        if (orderRequest) {
+        if (orderOperation) {
             log.info("Order response: status={}, body={}", response.statusCode(), response.body());
         }
         return response;
@@ -1138,7 +1111,7 @@ public class ExchangeOrderService {
         BigDecimal fillPrice = new BigDecimal(text(filled, "avgPx"));
         BigDecimal fillQuantity = new BigDecimal(text(filled, "totalSz"));
         String key = POSITION_KEY_PREFIX + userId;
-        OrderRequest.Position position = currentPosition(request, key);
+        Position position = currentPosition(key);
         position.setUserId(userId);
         position.setCoin(request.getCoin());
         if (isBuy) {
@@ -1152,18 +1125,18 @@ public class ExchangeOrderService {
                     position.getShortOpenPrice(), position.getShortQuantity(), fillPrice, fillQuantity));
             position.setShortQuantity(sum(position.getShortQuantity(), fillQuantity));
         }
-        savePosition(request, key, position);
+        savePosition(key, position);
         log.info("Hyperliquid position updated: key={}, coin={}, side={}, fillPrice={}, fillQuantity={}, "
                         + "orderId={}, orderStatus={}",
                 key, request.getCoin(), isBuy ? "long" : "short", fillPrice, fillQuantity,
                 orderId, text(orderStatus.get("order"), "status"));
     }
 
-    private OrderRequest.Position readPosition(String key) {
+    private Position readPosition(String key) {
         String value = stringRedisTemplate.opsForValue().get(key);
         if (blank(value)) return null;
         try {
-            return objectMapper.readValue(value, OrderRequest.Position.class);
+            return objectMapper.readValue(value, Position.class);
         } catch (Exception e) {
             log.warn("Failed to read existing position from {}; overwrite it", key, e);
             return null;

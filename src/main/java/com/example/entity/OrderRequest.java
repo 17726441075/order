@@ -24,9 +24,6 @@ public class OrderRequest {
     /** 套利模板配置。 */
     private OrderTemplate template;
 
-    /** 当前持仓。 */
-    private Position position;
-
     @Data
     @Builder
     @NoArgsConstructor
@@ -69,6 +66,7 @@ public class OrderRequest {
         private BigDecimal ta;
 
         /** 已经总额。 */
+        @Deprecated
         private BigDecimal ta2;
 
         /** 单笔开仓金额。 */
@@ -78,42 +76,4 @@ public class OrderRequest {
         private Integer ss;
     }
 
-    @Data
-    @Builder
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class Position {
-        /** 用户 ID。 */
-        private Integer userId;
-
-        /** 币种。 */
-        private String coin;
-
-        /** 多头交易所。 */
-        private String longExchange;
-
-        /** 空头交易所。 */
-        private String shortExchange;
-
-        /** 多头平均开仓价格。 */
-        private BigDecimal longOpenPrice;
-
-        /** 空头平均开仓价格。 */
-        private BigDecimal shortOpenPrice;
-
-        /** 多头持仓数量。 */
-        private BigDecimal longQuantity;
-
-        /** 空头持仓数量。 */
-        private BigDecimal shortQuantity;
-
-        /** 已匹配数量。 */
-        private BigDecimal matchedQuantity;
-
-        /** 仓位状态。 */
-        private String status;
-
-        /** 更新时间。 */
-        private Long updatedAt;
-    }
 }

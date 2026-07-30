@@ -86,25 +86,31 @@ public class OrderRequest {
         /** 用户 ID。 */
         private Integer userId;
 
-        /** 交易所名称。 */
-        private String exchange;
-
         /** 币种。 */
         private String coin;
 
-        /** 持仓方向。 */
-        private String side;
+        /** 多头交易所。 */
+        private String longExchange;
 
-        /** 平均开仓价格。 */
-        private BigDecimal openPrice;
+        /** 空头交易所。 */
+        private String shortExchange;
 
-        /** 持仓数量。 */
-        private BigDecimal quantity;
+        /** 多头平均开仓价格。 */
+        private BigDecimal longOpenPrice;
 
-        /** 最新订单 ID。 */
-        private Long orderId;
+        /** 空头平均开仓价格。 */
+        private BigDecimal shortOpenPrice;
 
-        /** 订单状态。 */
+        /** 多头持仓数量。 */
+        private BigDecimal longQuantity;
+
+        /** 空头持仓数量。 */
+        private BigDecimal shortQuantity;
+
+        /** 已匹配数量。 */
+        private BigDecimal matchedQuantity;
+
+        /** 仓位状态。 */
         private String status;
 
         /** 更新时间。 */

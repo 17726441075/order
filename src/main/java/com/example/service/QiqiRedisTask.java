@@ -79,25 +79,54 @@ public class QiqiRedisTask {
             return;
         }
         OrderRequest.OrderTemplate template = user.getTemplate();
-        if (template.getBy() == null || template.getAf() == null || template.getTa() == null
-                || template.getUs() == null || template.getUs().signum() <= 0) {
+        if (template.getSs() != null && template.getSs() != 1) {
             return;
         }
 
         Taoli quote = findQuote(user);
-        if (quote == null || quote.getOpenCha() == null) {
+        if (quote == null) {
             return;
         }
-        log.info("Arbitrage quote matched: userId={}, coin={}, longExchange={}, shortExchange={}",
-                template.getUr(), user.getCoin(),
-                user.getLongApi() == null ? null : user.getLongApi().getEe(),
-                user.getShortApi() == null ? null : user.getShortApi().getEe());
+
+        BigDecimal openedAmount = template.getTa2() == null ? BigDecimal.ZERO : template.getTa2();
+        OrderRequest.Position position = user.getPosition();
+        if (isPending(position)) {
+            exchangeOrderService.refreshPositionAsync(user, quote);
+            return;
+        }
+
+        if (isClosed(position) && openedAmount.signum() > 0) {
+            template.setTa2(BigDecimal.ZERO);
+            persistUser(userIndex, user);
+            log.info("Arbitrage position closed: userId={}, coin={}, ta2=0",
+                    template.getUr(), user.getCoin());
+            return;
+        }
+
+        if (openedAmount.signum() > 0 && position == null) {
+            exchangeOrderService.refreshPositionAsync(user, quote);
+            return;
+        }
+
+        if (hasOpenPosition(position) && shouldClose(template, quote)) {
+            closePosition(userIndex, user, quote);
+            return;
+        }
+
+        if (hasOpenPosition(position) && !isMatched(position)) {
+            return;
+        }
+
+        if (template.getBy() == null || template.getAf() == null || template.getTa() == null
+                || template.getUs() == null || template.getUs().signum() <= 0
+                || quote.getOpenCha() == null) {
+            return;
+        }
         if (quote.getOpenCha().compareTo(template.getBy()) < 0
                 || (quote.getAllFee() != null && quote.getAllFee().compareTo(template.getAf()) < 0)) {
             return;
         }
 
-        BigDecimal openedAmount = template.getTa2() == null ? BigDecimal.ZERO : template.getTa2();
         BigDecimal remainingAmount = template.getTa().subtract(openedAmount);
         if (remainingAmount.signum() <= 0) {
             return;
@@ -105,6 +134,8 @@ public class QiqiRedisTask {
 
         BigDecimal orderAmount = template.getUs().min(remainingAmount);
         BigDecimal originalAmount = template.getUs();
+        markPositionStatus(user, "OPENING");
+        persistUser(userIndex, user);
         template.setUs(orderAmount);
         log.info("Arbitrage open before: userId={}, coin={}, longExchange={}, shortExchange={}, openCha={}, "
                         + "netFundingRate={}, amount={}, ta2={}, target={}",
@@ -115,15 +146,103 @@ public class QiqiRedisTask {
         try {
             exchangeOrderService.placeOpenOrders(user, quote);
             template.setTa2(openedAmount.add(orderAmount));
-            stringRedisTemplate.opsForList().set(USERS_KEY, userIndex, objectMapper.writeValueAsString(user));
+            template.setUs(originalAmount);
+            markPositionStatus(user, "OPENING");
+            persistUser(userIndex, user);
             log.info("Arbitrage open after: userId={}, coin={}, amount={}, ta2={}",
                     template.getUr(), user.getCoin(), orderAmount, template.getTa2());
         } catch (Exception e) {
+            template.setUs(originalAmount);
+            markPositionStatus(user, "OPENING");
+            persistUser(userIndex, user);
+            exchangeOrderService.refreshPositionAsync(user, quote);
             log.error("Arbitrage open failed: userId={}, coin={}, amount={}",
                     template.getUr(), user.getCoin(), orderAmount, e);
         } finally {
             template.setUs(originalAmount);
         }
+    }
+
+    private void closePosition(int userIndex, OrderRequest user, Taoli quote) {
+        OrderRequest.OrderTemplate template = user.getTemplate();
+        OrderRequest.Position position = user.getPosition();
+        markPositionStatus(user, "CLOSING");
+        persistUser(userIndex, user);
+        log.info("Arbitrage close before: userId={}, coin={}, longExchange={}, shortExchange={}, "
+                        + "closeCha={}, closeTarget={}, longQuantity={}, shortQuantity={}",
+                template.getUr(), user.getCoin(),
+                user.getLongApi() == null ? null : user.getLongApi().getEe(),
+                user.getShortApi() == null ? null : user.getShortApi().getEe(),
+                quote.getCloseCha(), template.getSl(),
+                position.getLongQuantity(), position.getShortQuantity());
+        try {
+            exchangeOrderService.placeCloseOrders(user, quote);
+            markPositionStatus(user, "CLOSING");
+            persistUser(userIndex, user);
+            log.info("Arbitrage close submitted: userId={}, coin={}, longQuantity={}, shortQuantity={}",
+                    template.getUr(), user.getCoin(),
+                    position.getLongQuantity(), position.getShortQuantity());
+        } catch (Exception e) {
+            markPositionStatus(user, "CLOSING");
+            persistUser(userIndex, user);
+            exchangeOrderService.refreshPositionAsync(user, quote);
+            log.error("Arbitrage close failed: userId={}, coin={}",
+                    template.getUr(), user.getCoin(), e);
+        }
+    }
+
+    private void persistUser(int userIndex, OrderRequest user) {
+        try {
+            stringRedisTemplate.opsForList().set(
+                    USERS_KEY, userIndex, objectMapper.writeValueAsString(user));
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to update Redis user at index " + userIndex, e);
+        }
+    }
+
+    private static void markPositionStatus(OrderRequest user, String status) {
+        OrderRequest.Position position = user.getPosition();
+        if (position == null) {
+            position = new OrderRequest.Position();
+            position.setUserId(user.getTemplate().getUr());
+            position.setCoin(user.getCoin());
+            position.setLongExchange(user.getLongApi() == null ? null : user.getLongApi().getEe());
+            position.setShortExchange(user.getShortApi() == null ? null : user.getShortApi().getEe());
+            position.setLongQuantity(BigDecimal.ZERO);
+            position.setShortQuantity(BigDecimal.ZERO);
+            position.setMatchedQuantity(BigDecimal.ZERO);
+            user.setPosition(position);
+        }
+        position.setStatus(status);
+        position.setUpdatedAt(System.currentTimeMillis());
+    }
+
+    private static boolean shouldClose(OrderRequest.OrderTemplate template, Taoli quote) {
+        return template.getSl() != null && quote.getCloseCha() != null
+                && quote.getCloseCha().compareTo(template.getSl()) <= 0;
+    }
+
+    private static boolean hasOpenPosition(OrderRequest.Position position) {
+        return position != null
+                && (isPositive(position.getLongQuantity()) || isPositive(position.getShortQuantity()));
+    }
+
+    private static boolean isMatched(OrderRequest.Position position) {
+        return position != null && "MATCHED".equalsIgnoreCase(position.getStatus());
+    }
+
+    private static boolean isPending(OrderRequest.Position position) {
+        return position != null && ("OPENING".equalsIgnoreCase(position.getStatus())
+                || "CLOSING".equalsIgnoreCase(position.getStatus()));
+    }
+
+    private static boolean isClosed(OrderRequest.Position position) {
+        return position != null && "CLOSED".equalsIgnoreCase(position.getStatus())
+                && !hasOpenPosition(position);
+    }
+
+    private static boolean isPositive(BigDecimal value) {
+        return value != null && value.signum() > 0;
     }
 
     private Taoli findQuote(OrderRequest user) {

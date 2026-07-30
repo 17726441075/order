@@ -63,6 +63,7 @@ public class ExchangeOrderService {
     private static final long POSITION_QUERY_INITIAL_DELAY_MILLIS = 2_000L;
     private static final long POSITION_QUERY_INTERVAL_MILLIS = 2_000L;
     private static final long POSITION_QUERY_RETRY_MILLIS = 30_000L;
+    private static final int IBKR_ORDER_QUERY_MAX_ATTEMPTS = 60;
     private static final Set<String> POSITION_QUERY_EXCHANGES = Set.of(
             "okx", "binance", "bybit", "bitget", "gate", "gateio", "hyper", "hyperliquid");
     private final ObjectMapper objectMapper;
@@ -73,6 +74,12 @@ public class ExchangeOrderService {
     private final Object positionQueryRateLock = new Object();
     private final ExecutorService positionQueryExecutor = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "position-query-1");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final Set<String> pendingIbkrOrderQueries = ConcurrentHashMap.newKeySet();
+    private final ExecutorService ibkrOrderQueryExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "ibkr-order-query-1");
         thread.setDaemon(true);
         return thread;
     });
@@ -204,38 +211,62 @@ public class ExchangeOrderService {
                 "POST", requestBody, headers);
         String responseBody = requireSuccess(response, "IBKR");
         JsonNode order = objectMapper.readTree(responseBody);
-        if (!"filled".equalsIgnoreCase(text(order, "status"))) {
-            responseBody = waitForIbkrOrder(requestId, headers);
+        if ("filled".equalsIgnoreCase(text(order, "status"))) {
+            saveIbkrResult(request, requestId, isLong, close, responseBody);
+        } else {
+            scheduleIbkrOrderQuery(request, requestId, headers, isLong, close);
         }
+        return responseBody;
+    }
+
+    private void scheduleIbkrOrderQuery(OrderRequest request, String requestId,
+            Map<String, String> headers, boolean isLong, boolean close) throws Exception {
+        if (!pendingIbkrOrderQueries.add(requestId)) {
+            return;
+        }
+        OrderRequest requestSnapshot = objectMapper.readValue(
+                objectMapper.writeValueAsString(request), OrderRequest.class);
+        ibkrOrderQueryExecutor.execute(
+                () -> queryIbkrOrder(requestSnapshot, requestId, headers, isLong, close));
+    }
+
+    private void queryIbkrOrder(OrderRequest request, String requestId,
+            Map<String, String> headers, boolean isLong, boolean close) {
+        String lastResponse = "";
+        try {
+            for (int attempt = 0; attempt < IBKR_ORDER_QUERY_MAX_ATTEMPTS; attempt++) {
+                Thread.sleep(1_000L);
+                HttpResponse<String> response = send(ibkrUrl("/api/ibkr/orders/" + requestId),
+                        "GET", "", headers);
+                lastResponse = requireSuccess(response, "IBKR order query");
+                JsonNode order = objectMapper.readTree(lastResponse);
+                String status = text(order, "status");
+                log.info("IBKR order status: requestId={}, status={}, filled={}, remaining={}",
+                        requestId, status, text(order, "filled"), text(order, "remaining"));
+                if ("filled".equalsIgnoreCase(status)) {
+                    saveIbkrResult(request, requestId, isLong, close, lastResponse);
+                    return;
+                }
+                if (isIbkrFinalFailure(status)) {
+                    log.error("IBKR order failed: requestId={}, response={}", requestId, lastResponse);
+                    return;
+                }
+            }
+            log.error("IBKR order query timeout: requestId={}, response={}", requestId, lastResponse);
+        } catch (Exception e) {
+            log.error("IBKR background order query failed: requestId={}", requestId, e);
+        } finally {
+            pendingIbkrOrderQueries.remove(requestId);
+        }
+    }
+
+    private void saveIbkrResult(OrderRequest request, String requestId,
+            boolean isLong, boolean close, String responseBody) throws Exception {
         if (close) {
             applyIbkrCloseFill(request, requestId, isLong, responseBody);
         } else {
             saveIbkrPosition(request, requestId, isLong, responseBody);
         }
-        return responseBody;
-    }
-
-    private String waitForIbkrOrder(String requestId, Map<String, String> headers) throws Exception {
-        String lastResponse = "";
-        for (int attempt = 0; attempt < 15; attempt++) {
-            Thread.sleep(1_000L);
-            HttpResponse<String> response = send(ibkrUrl("/api/ibkr/orders/" + requestId),
-                    "GET", "", headers);
-            lastResponse = requireSuccess(response, "IBKR order query");
-            JsonNode order = objectMapper.readTree(lastResponse);
-            String status = text(order, "status");
-            log.info("IBKR order status: requestId={}, status={}, filled={}, remaining={}",
-                    requestId, status, text(order, "filled"), text(order, "remaining"));
-            if ("filled".equalsIgnoreCase(status)) {
-                return lastResponse;
-            }
-            if (isIbkrFinalFailure(status)) {
-                throw new IllegalStateException(
-                        "IBKR order failed: requestId=" + requestId + ", response=" + lastResponse);
-            }
-        }
-        throw new IllegalStateException(
-                "IBKR order status timeout: requestId=" + requestId + ", response=" + lastResponse);
     }
 
     private BigDecimal calculateExchangeSize(
@@ -505,6 +536,7 @@ public class ExchangeOrderService {
     @PreDestroy
     public void stopPositionQueryExecutor() {
         positionQueryExecutor.shutdownNow();
+        ibkrOrderQueryExecutor.shutdownNow();
     }
 
     private LegPosition loadOkxPosition(String coin, OrderRequest.ExchangeApi api,

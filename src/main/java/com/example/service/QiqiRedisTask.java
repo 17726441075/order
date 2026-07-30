@@ -166,6 +166,10 @@ public class QiqiRedisTask {
                 quote.getOpenCha(), quote.getAllFee(), orderAmount, openedAmount, template.getTa());
         try {
             exchangeOrderService.placeOpenOrders(user, quote, orderAmount);
+            Position latestPosition = loadRuntimePosition(user);
+            if (latestPosition != null) {
+                position = latestPosition;
+            }
             position.setOpenedAmount(openedAmount.add(orderAmount));
             position = markPositionStatus(user, position, "OPENING");
             persistPosition(user, position);
@@ -193,6 +197,10 @@ public class QiqiRedisTask {
                 position.getLongQuantity(), position.getShortQuantity());
         try {
             exchangeOrderService.placeCloseOrders(user, position, quote);
+            Position latestPosition = loadRuntimePosition(user);
+            if (latestPosition != null) {
+                position = latestPosition;
+            }
             position = markPositionStatus(user, position, "CLOSING");
             persistPosition(user, position);
             log.info("Arbitrage close submitted: userId={}, coin={}, longQuantity={}, shortQuantity={}",

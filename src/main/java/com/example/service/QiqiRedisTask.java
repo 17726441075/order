@@ -89,6 +89,9 @@ public class QiqiRedisTask {
         }
 
         Position position = loadRuntimePosition(user);
+        if (isClosed(position)) {
+            exchangeOrderService.clearOrderReplacementBlock(user);
+        }
         BigDecimal openedAmount = openedAmount(position);
         if (position != null && position.getOpenedAmount() == null && template.getTa2() != null) {
             position.setOpenedAmount(template.getTa2());
@@ -154,6 +157,7 @@ public class QiqiRedisTask {
         if (remainingAmount.signum() <= 0) {
             return;
         }
+        if (exchangeOrderService.isOrderReplacementBlocked(user)) return;
 
         BigDecimal orderAmount = template.getUs().min(remainingAmount);
         position = markPositionStatus(user, position, "OPENING");

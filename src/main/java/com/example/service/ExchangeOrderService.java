@@ -63,7 +63,7 @@ public class ExchangeOrderService {
     private static final long POSITION_QUERY_INITIAL_DELAY_MILLIS = 2_000L;
     private static final long POSITION_QUERY_INTERVAL_MILLIS = 2_000L;
     private static final long POSITION_QUERY_RETRY_MILLIS = 30_000L;
-    private static final int IBKR_ORDER_QUERY_MAX_ATTEMPTS = 60;
+    private static final int ORDER_QUERY_MAX_ATTEMPTS = 60;
     private static final Set<String> POSITION_QUERY_EXCHANGES = Set.of(
             "okx", "binance", "bybit", "bitget", "gate", "gateio", "hyper", "hyperliquid");
     private final ObjectMapper objectMapper;
@@ -77,9 +77,11 @@ public class ExchangeOrderService {
         thread.setDaemon(true);
         return thread;
     });
-    private final Set<String> pendingIbkrOrderQueries = ConcurrentHashMap.newKeySet();
-    private final ExecutorService ibkrOrderQueryExecutor = Executors.newSingleThreadExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "ibkr-order-query-1");
+    private final Set<String> pendingOrderQueries = ConcurrentHashMap.newKeySet();
+    private final Map<String, Integer> pendingStrategyOrderQueries = new ConcurrentHashMap<>();
+    private final Set<String> orderStrategiesWithMissingQuery = ConcurrentHashMap.newKeySet();
+    private final ExecutorService orderQueryExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "order-query-1");
         thread.setDaemon(true);
         return thread;
     });
@@ -98,6 +100,9 @@ public class ExchangeOrderService {
                 || orderAmount.signum() <= 0) {
             throw new IllegalArgumentException("orderAmount must be greater than 0");
         }
+        if (isOrderReplacementBlocked(request)) {
+            throw new IllegalStateException("order query is pending or missing; replacement order skipped");
+        }
         BigDecimal baseQuantity = calculateMatchedBaseQuantity(request, quote, orderAmount);
         Map<String, Object> result = new LinkedHashMap<>();
         try {
@@ -110,6 +115,19 @@ public class ExchangeOrderService {
             return result;
         } finally {
             refreshPositionAsync(request, quote);
+        }
+    }
+
+    public boolean isOrderReplacementBlocked(OrderRequest request) {
+        String strategyKey = PositionKey.of(request);
+        return strategyKey != null && (pendingStrategyOrderQueries.containsKey(strategyKey)
+                || orderStrategiesWithMissingQuery.contains(strategyKey));
+    }
+
+    public void clearOrderReplacementBlock(OrderRequest request) {
+        String strategyKey = PositionKey.of(request);
+        if (strategyKey != null && !pendingStrategyOrderQueries.containsKey(strategyKey)) {
+            orderStrategiesWithMissingQuery.remove(strategyKey);
         }
     }
 
@@ -141,18 +159,19 @@ public class ExchangeOrderService {
             OrderRequest.ExchangeApi api, boolean isLong, Map<String, Object> result) throws Exception {
         if (api == null || blank(api.getEe())) return;
         String exchange = api.getEe().trim().toLowerCase(Locale.ROOT);
+        String strategyKey = PositionKey.of(request);
         String response = switch (exchange) {
             case "ibkr" -> orderIbkr(request, baseQuantity, isLong, false);
             case "okx" -> orderOkx(formatContract(request.getCoin(), exchange),
-                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong);
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, strategyKey);
             case "binance" -> orderBinance(formatContract(request.getCoin(), exchange),
-                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false);
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false, strategyKey);
             case "bybit" -> orderBybit(formatContract(request.getCoin(), exchange),
-                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false);
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false, strategyKey);
             case "bitget" -> orderBitget(formatContract(request.getCoin(), exchange),
-                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false);
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false, strategyKey);
             case "gate", "gateio" -> orderGate(formatContract(request.getCoin(), exchange),
-                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false);
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false, strategyKey);
             case "hyper", "hyperliquid" -> null;
             default -> throw new IllegalArgumentException("Unsupported exchange: " + api.getEe());
         };
@@ -166,18 +185,19 @@ public class ExchangeOrderService {
             return;
         }
         String exchange = api.getEe().trim().toLowerCase(Locale.ROOT);
+        String strategyKey = PositionKey.of(request);
         try {
             Object response = switch (exchange) {
                 case "ibkr" -> orderIbkr(request, baseQuantity, isLong, true);
                 case "okx" -> closeOkx(formatContract(request.getCoin(), exchange), api, isLong);
                 case "binance" -> orderBinance(formatContract(request.getCoin(), exchange),
-                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true);
+                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true, strategyKey);
                 case "bybit" -> orderBybit(formatContract(request.getCoin(), exchange),
-                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true);
+                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true, strategyKey);
                 case "bitget" -> orderBitget(formatContract(request.getCoin(), exchange),
-                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true);
+                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true, strategyKey);
                 case "gate", "gateio" -> orderGate(formatContract(request.getCoin(), exchange),
-                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true);
+                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true, strategyKey);
                 case "hyper", "hyperliquid" ->
                     orderHyperliquid(request, baseQuantity, api, isLong, true);
                 default -> throw new IllegalArgumentException("Unsupported exchange: " + api.getEe());
@@ -221,20 +241,25 @@ public class ExchangeOrderService {
 
     private void scheduleIbkrOrderQuery(OrderRequest request, String requestId,
             Map<String, String> headers, boolean isLong, boolean close) throws Exception {
-        if (!pendingIbkrOrderQueries.add(requestId)) {
+        String queryKey = "ibkr:" + requestId;
+        if (!pendingOrderQueries.add(queryKey)) {
             return;
         }
+        String strategyKey = PositionKey.of(request);
+        registerStrategyOrderQuery(strategyKey);
         OrderRequest requestSnapshot = objectMapper.readValue(
                 objectMapper.writeValueAsString(request), OrderRequest.class);
-        ibkrOrderQueryExecutor.execute(
-                () -> queryIbkrOrder(requestSnapshot, requestId, headers, isLong, close));
+        orderQueryExecutor.execute(
+                () -> queryIbkrOrder(requestSnapshot, requestId, headers, isLong, close, queryKey, strategyKey));
     }
 
     private void queryIbkrOrder(OrderRequest request, String requestId,
-            Map<String, String> headers, boolean isLong, boolean close) {
+            Map<String, String> headers, boolean isLong, boolean close,
+            String queryKey, String strategyKey) {
         String lastResponse = "";
+        boolean resolved = false;
         try {
-            for (int attempt = 0; attempt < IBKR_ORDER_QUERY_MAX_ATTEMPTS; attempt++) {
+            for (int attempt = 0; attempt < ORDER_QUERY_MAX_ATTEMPTS; attempt++) {
                 Thread.sleep(1_000L);
                 HttpResponse<String> response = send(ibkrUrl("/api/ibkr/orders/" + requestId),
                         "GET", "", headers);
@@ -245,10 +270,12 @@ public class ExchangeOrderService {
                         requestId, status, text(order, "filled"), text(order, "remaining"));
                 if ("filled".equalsIgnoreCase(status)) {
                     saveIbkrResult(request, requestId, isLong, close, lastResponse);
+                    resolved = true;
                     return;
                 }
                 if (isIbkrFinalFailure(status)) {
                     log.error("IBKR order failed: requestId={}, response={}", requestId, lastResponse);
+                    resolved = true;
                     return;
                 }
             }
@@ -256,7 +283,7 @@ public class ExchangeOrderService {
         } catch (Exception e) {
             log.error("IBKR background order query failed: requestId={}", requestId, e);
         } finally {
-            pendingIbkrOrderQueries.remove(requestId);
+            finishStrategyOrderQuery(queryKey, strategyKey, resolved);
         }
     }
 
@@ -536,7 +563,7 @@ public class ExchangeOrderService {
     @PreDestroy
     public void stopPositionQueryExecutor() {
         positionQueryExecutor.shutdownNow();
-        ibkrOrderQueryExecutor.shutdownNow();
+        orderQueryExecutor.shutdownNow();
     }
 
     private LegPosition loadOkxPosition(String coin, OrderRequest.ExchangeApi api,
@@ -886,7 +913,8 @@ public class ExchangeOrderService {
                 || "local_rejected".equalsIgnoreCase(status);
     }
 
-    private String orderOkx(String coin, BigDecimal size, OrderRequest.ExchangeApi api, boolean isLong)
+    private String orderOkx(String coin, BigDecimal size, OrderRequest.ExchangeApi api, boolean isLong,
+            String strategyKey)
             throws Exception {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("instId", coin);
@@ -904,7 +932,10 @@ public class ExchangeOrderService {
                         timestamp + "POST" + path + requestBody),
                 "OK-ACCESS-TIMESTAMP", timestamp,
                 "OK-ACCESS-PASSPHRASE", required(api.getAp(), "OKX passphrase")));
-        return requireOkxSuccess(response);
+        String responseBody = requireOkxSuccess(response);
+        scheduleOrderQuery(new OrderQuery("okx", coin, api, orderId(responseBody, "OKX"),
+                null, isLong, false, strategyKey));
+        return responseBody;
     }
 
     private String closeOkx(String coin, OrderRequest.ExchangeApi api, boolean isLong)
@@ -926,7 +957,7 @@ public class ExchangeOrderService {
     }
 
     private String orderBinance(String coin, BigDecimal size, OrderRequest.ExchangeApi api,
-            boolean isLong, boolean close) throws Exception {
+            boolean isLong, boolean close, String strategyKey) throws Exception {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("symbol", coin);
         params.put("side", close ? (isLong ? "SELL" : "BUY") : (isLong ? "BUY" : "SELL"));
@@ -940,11 +971,14 @@ public class ExchangeOrderService {
                 + hmacHex("HmacSHA256", required(api.getAc(), "Binance secretKey"), query);
         HttpResponse<String> response = send("https://fapi.binance.com/fapi/v1/order?" + signedQuery,
                 "POST", "", Map.of("X-MBX-APIKEY", required(api.getAk(), "Binance apiKey")));
-        return requireSuccess(response, "Binance");
+        String responseBody = requireSuccess(response, "Binance");
+        scheduleOrderQuery(new OrderQuery("binance", coin, api, orderId(responseBody, "Binance"),
+                text(objectMapper.readTree(responseBody), "clientOrderId"), isLong, close, strategyKey));
+        return responseBody;
     }
 
     private String orderBybit(String coin, BigDecimal size, OrderRequest.ExchangeApi api,
-            boolean isLong, boolean close) throws Exception {
+            boolean isLong, boolean close, String strategyKey) throws Exception {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("category", "linear");
         body.put("symbol", coin);
@@ -964,11 +998,16 @@ public class ExchangeOrderService {
                 "X-BAPI-API-KEY", key,
                 "X-BAPI-TIMESTAMP", timestamp,
                 "X-BAPI-RECV-WINDOW", window));
-        return requireJsonCode(response, "Bybit", "retCode", "0");
+        String responseBody = requireJsonCode(response, "Bybit", "retCode", "0");
+        JsonNode result = objectMapper.readTree(responseBody);
+        JsonNode data = result.get("result");
+        scheduleOrderQuery(new OrderQuery("bybit", coin, api,
+                text(data, "orderId"), text(data, "orderLinkId"), isLong, close, strategyKey));
+        return responseBody;
     }
 
     private String orderBitget(String coin, BigDecimal size, OrderRequest.ExchangeApi api,
-            boolean isLong, boolean close) throws Exception {
+            boolean isLong, boolean close, String strategyKey) throws Exception {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("symbol", coin);
         body.put("productType", "USDT-FUTURES");
@@ -989,11 +1028,15 @@ public class ExchangeOrderService {
                 "ACCESS-TIMESTAMP", timestamp,
                 "ACCESS-PASSPHRASE", required(api.getAp(), "Bitget passphrase"),
                 "locale", "zh-CN"));
-        return requireJsonCode(response, "Bitget", "code", "00000");
+        String responseBody = requireJsonCode(response, "Bitget", "code", "00000");
+        JsonNode data = objectMapper.readTree(responseBody).get("data");
+        scheduleOrderQuery(new OrderQuery("bitget", coin, api,
+                text(data, "orderId"), text(data, "clientOid"), isLong, close, strategyKey));
+        return responseBody;
     }
 
     private String orderGate(String coin, BigDecimal size, OrderRequest.ExchangeApi api,
-            boolean isLong, boolean close) throws Exception {
+            boolean isLong, boolean close, String strategyKey) throws Exception {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("contract", coin);
         boolean buy = close ? !isLong : isLong;
@@ -1010,7 +1053,220 @@ public class ExchangeOrderService {
                 "KEY", required(api.getAk(), "Gate apiKey"),
                 "Timestamp", timestamp,
                 "SIGN", hmacHex("HmacSHA512", required(api.getAc(), "Gate secretKey"), preSign)));
-        return requireSuccess(response, "Gate");
+        String responseBody = requireSuccess(response, "Gate");
+        scheduleOrderQuery(new OrderQuery("gate", coin, api,
+                orderId(responseBody, "Gate"), null, isLong, close, strategyKey));
+        return responseBody;
+    }
+
+    private void scheduleOrderQuery(OrderQuery query) throws Exception {
+        if (query == null || (blank(query.orderId()) && blank(query.clientOrderId()))) return;
+        String identifier = blank(query.orderId()) ? query.clientOrderId() : query.orderId();
+        String queryKey = query.exchange() + ":" + identifier;
+        if (!pendingOrderQueries.add(queryKey)) return;
+        registerStrategyOrderQuery(query.strategyKey());
+        OrderRequest.ExchangeApi apiSnapshot = objectMapper.readValue(
+                objectMapper.writeValueAsString(query.api()), OrderRequest.ExchangeApi.class);
+        OrderQuery snapshot = new OrderQuery(query.exchange(), query.coin(), apiSnapshot,
+                query.orderId(), query.clientOrderId(), query.isLong(), query.close(), query.strategyKey());
+        orderQueryExecutor.execute(() -> runOrderQuery(snapshot, queryKey));
+    }
+
+    private void registerStrategyOrderQuery(String strategyKey) {
+        if (strategyKey != null) {
+            pendingStrategyOrderQueries.merge(strategyKey, 1, Integer::sum);
+        }
+    }
+
+    private void finishStrategyOrderQuery(String queryKey, String strategyKey, boolean resolved) {
+        pendingOrderQueries.remove(queryKey);
+        if (strategyKey == null) return;
+        if (!resolved) orderStrategiesWithMissingQuery.add(strategyKey);
+        pendingStrategyOrderQueries.computeIfPresent(strategyKey, (key, count) ->
+                count > 1 ? count - 1 : null);
+    }
+
+    private void runOrderQuery(OrderQuery query, String queryKey) {
+        boolean resolved = false;
+        try {
+            Thread.sleep(1_000L);
+            for (int attempt = 0; attempt < ORDER_QUERY_MAX_ATTEMPTS; attempt++) {
+                OrderQueryResult result = queryOrder(query);
+                if (!result.found()) {
+                    log.warn("{} order not found: orderId={}, clientOrderId={}, position update skipped",
+                            query.exchange(), query.orderId(), query.clientOrderId());
+                    return;
+                }
+                log.info("{} order status: orderId={}, status={}",
+                        query.exchange(), query.orderId(), result.status());
+                if (isOrderFilled(query.exchange(), result.status())
+                        || isOrderFinal(query.exchange(), result.status())) {
+                    resolved = true;
+                    return;
+                }
+                Thread.sleep(1_000L);
+            }
+            log.warn("{} order query timeout: orderId={}, position update skipped",
+                    query.exchange(), query.orderId());
+        } catch (Exception e) {
+            log.warn("{} background order query failed: orderId={}, position update skipped",
+                    query.exchange(), query.orderId(), e);
+        } finally {
+            finishStrategyOrderQuery(queryKey, query.strategyKey(), resolved);
+        }
+    }
+
+    private OrderQueryResult queryOrder(OrderQuery query) throws Exception {
+        return switch (query.exchange()) {
+            case "okx" -> queryOkxOrder(query);
+            case "binance" -> queryBinanceOrder(query);
+            case "bybit" -> queryBybitOrder(query);
+            case "bitget" -> queryBitgetOrder(query);
+            case "gate", "gateio" -> queryGateOrder(query);
+            default -> new OrderQueryResult(false, "");
+        };
+    }
+
+    private OrderQueryResult queryOkxOrder(OrderQuery query) throws Exception {
+        String path = "/api/v5/trade/order";
+        String queryString = "instId=" + query.coin() + "&ordId=" + query.orderId();
+        String timestamp = OKX_TIME.format(Instant.now());
+        HttpResponse<String> response = send("https://www.okx.com" + path + "?" + queryString,
+                "GET", "", Map.of(
+                        "OK-ACCESS-KEY", required(query.api().getAk(), "OKX apiKey"),
+                        "OK-ACCESS-SIGN", hmacBase64("HmacSHA256", required(query.api().getAc(), "OKX secretKey"),
+                                timestamp + "GET" + path + "?" + queryString),
+                        "OK-ACCESS-TIMESTAMP", timestamp,
+                        "OK-ACCESS-PASSPHRASE", required(query.api().getAp(), "OKX passphrase")));
+        String body = requireSuccess(response, "OKX order query");
+        JsonNode root = objectMapper.readTree(body);
+        JsonNode data = root.get("data");
+        if (!"0".equals(text(root, "code")) || data == null || data.size() == 0) {
+            return new OrderQueryResult(false, "");
+        }
+        return new OrderQueryResult(true, text(data.get(0), "state"));
+    }
+
+    private OrderQueryResult queryBinanceOrder(OrderQuery query) throws Exception {
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", query.coin());
+        if (!blank(query.orderId())) params.put("orderId", query.orderId());
+        else params.put("origClientOrderId", query.clientOrderId());
+        params.put("recvWindow", "5000");
+        params.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        String queryString = query(params);
+        String signedQuery = queryString + "&signature="
+                + hmacHex("HmacSHA256", required(query.api().getAc(), "Binance secretKey"), queryString);
+        HttpResponse<String> response = send("https://fapi.binance.com/fapi/v1/order?" + signedQuery,
+                "GET", "", Map.of("X-MBX-APIKEY", required(query.api().getAk(), "Binance apiKey")));
+        String body = requireSuccess(response, "Binance order query");
+        JsonNode root = objectMapper.readTree(body);
+        if (!root.has("orderId")) return new OrderQueryResult(false, "");
+        return new OrderQueryResult(true, text(root, "status"));
+    }
+
+    private OrderQueryResult queryBybitOrder(OrderQuery query) throws Exception {
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("category", "linear");
+        params.put("symbol", query.coin());
+        if (!blank(query.orderId())) params.put("orderId", query.orderId());
+        else params.put("orderLinkId", query.clientOrderId());
+        String queryString = query(params);
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String key = required(query.api().getAk(), "Bybit apiKey");
+        String window = "5000";
+        HttpResponse<String> response = send("https://api.bybit.com/v5/order/realtime?" + queryString,
+                "GET", "", Map.of(
+                        "X-BAPI-SIGN", hmacHex("HmacSHA256", required(query.api().getAc(), "Bybit secretKey"),
+                                timestamp + key + window + queryString),
+                        "X-BAPI-API-KEY", key,
+                        "X-BAPI-TIMESTAMP", timestamp,
+                        "X-BAPI-RECV-WINDOW", window));
+        String body = requireSuccess(response, "Bybit order query");
+        JsonNode root = objectMapper.readTree(body);
+        JsonNode rows = root.get("result") == null ? null : root.get("result").get("list");
+        if (!"0".equals(text(root, "retCode")) || rows == null || rows.size() == 0) {
+            return new OrderQueryResult(false, "");
+        }
+        return new OrderQueryResult(true, text(rows.get(0), "orderStatus"));
+    }
+
+    private OrderQueryResult queryBitgetOrder(OrderQuery query) throws Exception {
+        String path = "/api/v2/mix/order/detail";
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", query.coin());
+        params.put("productType", "USDT-FUTURES");
+        if (!blank(query.orderId())) params.put("orderId", query.orderId());
+        else params.put("clientOid", query.clientOrderId());
+        String queryString = query(params);
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        HttpResponse<String> response = send("https://api.bitget.com" + path + "?" + queryString,
+                "GET", "", Map.of(
+                        "ACCESS-KEY", required(query.api().getAk(), "Bitget apiKey"),
+                        "ACCESS-SIGN", hmacBase64("HmacSHA256", required(query.api().getAc(), "Bitget secretKey"),
+                                timestamp + "GET" + path + "?" + queryString),
+                        "ACCESS-TIMESTAMP", timestamp,
+                        "ACCESS-PASSPHRASE", required(query.api().getAp(), "Bitget passphrase"),
+                        "locale", "zh-CN"));
+        String body = requireSuccess(response, "Bitget order query");
+        JsonNode root = objectMapper.readTree(body);
+        JsonNode data = root.get("data");
+        if (!"00000".equals(text(root, "code")) || data == null || data.isNull()) {
+            return new OrderQueryResult(false, "");
+        }
+        return new OrderQueryResult(true, text(data, "state"));
+    }
+
+    private OrderQueryResult queryGateOrder(OrderQuery query) throws Exception {
+        String path = "/api/v4/futures/usdt/orders/" + query.orderId();
+        String queryString = "contract=" + query.coin();
+        String timestamp = String.valueOf(System.currentTimeMillis() / 1000);
+        String preSign = "GET\n" + path + "\n" + queryString + "\n" + sha512("") + "\n" + timestamp;
+        HttpResponse<String> response = send("https://api.gateio.ws" + path + "?" + queryString,
+                "GET", "", Map.of(
+                        "KEY", required(query.api().getAk(), "Gate apiKey"),
+                        "Timestamp", timestamp,
+                        "SIGN", hmacHex("HmacSHA512", required(query.api().getAc(), "Gate secretKey"), preSign)));
+        String body = requireSuccess(response, "Gate order query");
+        JsonNode root = objectMapper.readTree(body);
+        if (!root.has("id")) return new OrderQueryResult(false, "");
+        return new OrderQueryResult(true, text(root, "status"));
+    }
+
+    private static boolean isOrderFilled(String exchange, String status) {
+        return switch (exchange) {
+            case "okx" -> "filled".equalsIgnoreCase(status);
+            case "binance" -> "FILLED".equalsIgnoreCase(status);
+            case "bybit" -> "Filled".equalsIgnoreCase(status);
+            case "bitget" -> "filled".equalsIgnoreCase(status);
+            case "gate", "gateio" -> "finished".equalsIgnoreCase(status);
+            default -> false;
+        };
+    }
+
+    private static boolean isOrderFinal(String exchange, String status) {
+        return switch (exchange) {
+            case "okx" -> Set.of("canceled", "mmp_canceled").contains(status.toLowerCase(Locale.ROOT));
+            case "binance" -> Set.of("CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH")
+                    .contains(status.toUpperCase(Locale.ROOT));
+            case "bybit" -> Set.of("Cancelled", "Rejected", "Deactivated", "Triggered")
+                    .contains(status);
+            case "bitget" -> Set.of("canceled", "cancelled", "rejected").contains(status.toLowerCase(Locale.ROOT));
+            case "gate", "gateio" -> Set.of("finished", "cancelled", "liquidated", "closed")
+                    .contains(status.toLowerCase(Locale.ROOT));
+            default -> false;
+        };
+    }
+
+    private String orderId(String body, String exchange) throws Exception {
+        JsonNode root = objectMapper.readTree(body);
+        String id = text(root, "orderId");
+        if (id.isBlank()) id = text(root, "id");
+        if (id.isBlank() && "OKX".equals(exchange)) {
+            JsonNode data = root.get("data");
+            if (data != null && data.size() > 0) id = text(data.get(0), "ordId");
+        }
+        return id;
     }
 
     private HttpResponse<String> send(String url, String method, String body, Map<String, String> headers)
@@ -1177,16 +1433,51 @@ public class ExchangeOrderService {
             throw new IllegalStateException("Hyperliquid order was not filled: " + responseBody);
         }
         long orderId = filled.get("oid").asLong();
-        JsonNode orderStatus = queryHyperliquidOrder(api.getAk(), orderId);
-        if (!close) {
-            saveHyperliquidPosition(request, isBuy, orderId, filled, orderStatus);
-        }
+        scheduleHyperliquidOrderQuery(request, api, isBuy, close, orderId, filled);
         return Map.of("exchange", "hyperliquid", "coin", request.getCoin(),
                 "side", isBuy ? "buy" : "sell", "quantity", size, "price", price,
-                "reduceOnly", close, "orderStatus", orderStatus, "response", result);
+                "reduceOnly", close, "orderStatus", "PENDING", "response", result);
     }
 
-    private JsonNode queryHyperliquidOrder(String accountAddress, long orderId) throws Exception {
+    private void scheduleHyperliquidOrderQuery(OrderRequest request,
+            OrderRequest.ExchangeApi api, boolean isBuy, boolean close,
+            long orderId, JsonNode filled) throws Exception {
+        String queryKey = "hyperliquid:" + orderId;
+        if (!pendingOrderQueries.add(queryKey)) return;
+        String strategyKey = PositionKey.of(request);
+        registerStrategyOrderQuery(strategyKey);
+        OrderRequest requestSnapshot = objectMapper.readValue(
+                objectMapper.writeValueAsString(request), OrderRequest.class);
+        OrderRequest.ExchangeApi apiSnapshot = objectMapper.readValue(
+                objectMapper.writeValueAsString(api), OrderRequest.ExchangeApi.class);
+        String filledJson = objectMapper.writeValueAsString(filled);
+        orderQueryExecutor.execute(() -> queryHyperliquidOrder(
+                requestSnapshot, apiSnapshot, isBuy, close, orderId, filledJson, queryKey, strategyKey));
+    }
+
+    private void queryHyperliquidOrder(OrderRequest request, OrderRequest.ExchangeApi api,
+            boolean isBuy, boolean close, long orderId, String filledJson,
+            String queryKey, String strategyKey) {
+        boolean resolved = false;
+        try {
+            Thread.sleep(1_000L);
+            JsonNode result = queryHyperliquidOrderOnce(api.getAk(), orderId);
+            if (result == null) {
+                log.warn("Hyperliquid order not found: orderId={}, position update skipped", orderId);
+                return;
+            }
+            JsonNode filled = objectMapper.readTree(filledJson);
+            if (!close) saveHyperliquidPosition(request, isBuy, orderId, filled, result);
+            resolved = true;
+        } catch (Exception e) {
+            log.warn("Hyperliquid background order query failed: orderId={}, position update skipped",
+                    orderId, e);
+        } finally {
+            finishStrategyOrderQuery(queryKey, strategyKey, resolved);
+        }
+    }
+
+    private JsonNode queryHyperliquidOrderOnce(String accountAddress, long orderId) throws Exception {
         String requestBody = objectMapper.writeValueAsString(Map.of(
                 "type", "orderStatus",
                 "user", accountAddress.trim(),
@@ -1195,7 +1486,10 @@ public class ExchangeOrderService {
         JsonNode order = result.get("order");
         String status = text(order, "status");
         log.info("Hyperliquid order status: orderId={}, status={}", orderId, status);
-        if (!"order".equalsIgnoreCase(text(result, "status")) || !"filled".equalsIgnoreCase(status)) {
+        if (!"order".equalsIgnoreCase(text(result, "status"))) {
+            return null;
+        }
+        if (!"filled".equalsIgnoreCase(status)) {
             throw new IllegalStateException(
                     "Hyperliquid order is not filled: orderId=" + orderId + ", response=" + result);
         }
@@ -1444,6 +1738,12 @@ public class ExchangeOrderService {
     private record AssetCache(Asset asset, long expiresAt) {}
 
     private record LegPosition(String exchange, BigDecimal openPrice, BigDecimal quantity) {}
+
+    private record OrderQuery(String exchange, String coin, OrderRequest.ExchangeApi api,
+            String orderId, String clientOrderId, boolean isLong, boolean close,
+            String strategyKey) {}
+
+    private record OrderQueryResult(boolean found, String status) {}
 
     private record Signature(String r, String s, int v) {
         Map<String, Object> toMap() { return Map.of("r", r, "s", s, "v", v); }

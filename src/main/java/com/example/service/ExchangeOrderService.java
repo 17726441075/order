@@ -1428,8 +1428,16 @@ public class ExchangeOrderService {
         if (!"ok".equalsIgnoreCase(text(result, "status"))) {
             throw new IllegalStateException("Hyperliquid order rejected: " + responseBody);
         }
-        JsonNode filled = result.get("response").get("data").get("statuses").get(0).get("filled");
+        JsonNode orderResult = result.get("response").get("data").get("statuses").get(0);
+        JsonNode filled = orderResult.get("filled");
         if (filled == null || filled.isNull()) {
+            if (close && isReduceOnlyPositionAlreadyClosed(orderResult)) {
+                log.warn("Hyperliquid position already closed: coin={}, side={}, response={}",
+                        request.getCoin(), isLong ? "long" : "short", responseBody);
+                return Map.of("exchange", "hyperliquid", "coin", request.getCoin(),
+                        "side", isBuy ? "buy" : "sell", "quantity", size, "price", price,
+                        "reduceOnly", true, "orderStatus", "ALREADY_CLOSED", "response", result);
+            }
             throw new IllegalStateException("Hyperliquid order was not filled: " + responseBody);
         }
         long orderId = filled.get("oid").asLong();
@@ -1437,6 +1445,11 @@ public class ExchangeOrderService {
         return Map.of("exchange", "hyperliquid", "coin", request.getCoin(),
                 "side", isBuy ? "buy" : "sell", "quantity", size, "price", price,
                 "reduceOnly", close, "orderStatus", "PENDING", "response", result);
+    }
+
+    private static boolean isReduceOnlyPositionAlreadyClosed(JsonNode orderResult) {
+        return text(orderResult, "error").toLowerCase(Locale.ROOT)
+                .contains("reduce only order would increase position");
     }
 
     private void scheduleHyperliquidOrderQuery(OrderRequest request,

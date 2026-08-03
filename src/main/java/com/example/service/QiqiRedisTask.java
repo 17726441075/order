@@ -36,8 +36,9 @@ public class QiqiRedisTask {
     @Getter
     private volatile ArrayList<OrderRequest> usersList = new ArrayList<>();
 
-    @Scheduled(fixedRate = 200)
+    @Scheduled(fixedRate = 1000)
     public void refreshQiqi() {
+        log.warn("");
         try {
             String value = stringRedisTemplate.opsForValue().get(KEY);
             if (!StringUtils.hasText(value)) {

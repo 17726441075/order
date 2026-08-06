@@ -156,7 +156,9 @@ public class QiqiRedisTask {
         }
 
         if (template.getBy() == null || template.getAf() == null || template.getTa() == null
-                || template.getUs() == null || template.getUs().signum() <= 0
+                || template.getMin() == null || template.getMax() == null
+                || template.getMin().signum() <= 0 || template.getMax().signum() <= 0
+                || template.getMin().compareTo(template.getMax()) > 0
                 || quote.getOpenCha() == null) {
             return;
         }
@@ -171,7 +173,11 @@ public class QiqiRedisTask {
         }
         if (exchangeOrderService.isOrderReplacementBlocked(user)) return;
 
-        BigDecimal orderAmount = template.getUs().min(remainingAmount);
+        BigDecimal orderAmount = exchangeOrderService.selectOpenOrderAmount(
+                user, quote, remainingAmount, template.getMin(), template.getMax());
+        if (orderAmount == null) {
+            return;
+        }
         position = markPositionStatus(user, position, "OPENING");
         persistPosition(user, position);
         log.info("Arbitrage open before: userId={}, coin={}, longExchange={}, shortExchange={}, openCha={}, "

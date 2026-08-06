@@ -121,6 +121,44 @@ public class ExchangeOrderService {
         }
     }
 
+    public BigDecimal selectOpenOrderAmount(OrderRequest request, Taoli quote,
+            BigDecimal remainingAmount, BigDecimal minimumAmount, BigDecimal maximumAmount) {
+        if (remainingAmount == null || remainingAmount.signum() <= 0
+                || minimumAmount == null || maximumAmount == null
+                || minimumAmount.signum() <= 0 || maximumAmount.signum() <= 0
+                || minimumAmount.compareTo(maximumAmount) > 0
+                || remainingAmount.compareTo(minimumAmount) < 0) {
+            return null;
+        }
+        try {
+            calculateMatchedBaseQuantity(request, quote, minimumAmount);
+            return minimumAmount;
+        } catch (Exception minimumFailure) {
+            BigDecimal fallbackAmount = maximumAmount.min(remainingAmount);
+            if (fallbackAmount.compareTo(minimumAmount) <= 0) {
+                log.warn("Minimum order amount is unavailable and no larger amount can be used: "
+                                + "userId={}, coin={}, min={}, max={}, remaining={}",
+                        request.getTemplate().getUr(), request.getCoin(),
+                        minimumAmount, maximumAmount, remainingAmount);
+                return null;
+            }
+            try {
+                calculateMatchedBaseQuantity(request, quote, fallbackAmount);
+                log.info("Minimum order amount is unavailable; use fallback amount: "
+                                + "userId={}, coin={}, min={}, amount={}",
+                        request.getTemplate().getUr(), request.getCoin(),
+                        minimumAmount, fallbackAmount);
+                return fallbackAmount;
+            } catch (Exception fallbackFailure) {
+                log.warn("No valid order amount in configured range: userId={}, coin={}, "
+                                + "min={}, max={}, remaining={}",
+                        request.getTemplate().getUr(), request.getCoin(),
+                        minimumAmount, maximumAmount, remainingAmount);
+                return null;
+            }
+        }
+    }
+
     private void preflightOpenOrders(OrderRequest request, Taoli quote, BigDecimal baseQuantity)
             throws Exception {
         preflightOpenLeg(request, quote, baseQuantity, request.getLongApi(), true);
@@ -1454,11 +1492,6 @@ public class ExchangeOrderService {
         }
         requireAddress(api.getAk(), "Hyperliquid account address");
         requireAddress(api.getAp(), "Hyperliquid agent address");
-        if (!close && (request.getTemplate() == null || request.getTemplate().getUs() == null
-                || request.getTemplate().getUs().signum() <= 0)) {
-            throw new IllegalArgumentException("template.us must be greater than 0");
-        }
-
         Asset asset = loadHyperliquidAsset(request.getCoin());
         BigDecimal quantity = baseQuantity.setScale(asset.szDecimals(), RoundingMode.DOWN);
         if (quantity.signum() <= 0) throw new IllegalArgumentException("matched quantity is too small");

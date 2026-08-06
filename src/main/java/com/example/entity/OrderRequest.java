@@ -69,8 +69,11 @@ public class OrderRequest {
         @Deprecated
         private BigDecimal ta2;
 
-        /** 单笔开仓金额。 */
-        private BigDecimal us;
+        /** 单笔最小开仓金额。 */
+        private BigDecimal min;
+
+        /** 单笔最大开仓金额。 */
+        private BigDecimal max;
 
         /** 模板状态。 */
         private Integer ss;

@@ -68,7 +68,9 @@ public class ExchangeOrderService {
             "okx", "binance", "bybit", "bitget", "gate", "gateio", "hyper", "hyperliquid");
     private final ObjectMapper objectMapper;
     private final StringRedisTemplate stringRedisTemplate;
+    private final CloseProfitService closeProfitService;
     private final Map<String, AssetCache> hyperliquidAssetCache = new ConcurrentHashMap<>();
+    private final Map<String, Object> positionLocks = new ConcurrentHashMap<>();
     private final Set<String> pendingPositionQueries = ConcurrentHashMap.newKeySet();
     private final Map<String, Long> positionQueryRetryAt = new ConcurrentHashMap<>();
     private final Object positionQueryRateLock = new Object();
@@ -104,17 +106,34 @@ public class ExchangeOrderService {
             throw new IllegalStateException("order query is pending or missing; replacement order skipped");
         }
         BigDecimal baseQuantity = calculateMatchedBaseQuantity(request, quote, orderAmount);
+        preflightOpenOrders(request, quote, baseQuantity);
         Map<String, Object> result = new LinkedHashMap<>();
         try {
-            placeLeg(request, quote, baseQuantity, request.getLongApi(), true, result);
-            placeLeg(request, quote, baseQuantity, request.getShortApi(), false, result);
             Map<String, Object> hyperliquidResult = placeHyperliquidIfNeeded(request, baseQuantity);
             if (!"no hyperliquid leg".equals(hyperliquidResult.get("message"))) {
                 result.put("hyperliquid", hyperliquidResult);
             }
+            placeLeg(request, quote, baseQuantity, request.getLongApi(), true, result);
+            placeLeg(request, quote, baseQuantity, request.getShortApi(), false, result);
             return result;
         } finally {
             refreshPositionAsync(request, quote);
+        }
+    }
+
+    private void preflightOpenOrders(OrderRequest request, Taoli quote, BigDecimal baseQuantity)
+            throws Exception {
+        preflightOpenLeg(request, quote, baseQuantity, request.getLongApi(), true);
+        preflightOpenLeg(request, quote, baseQuantity, request.getShortApi(), false);
+    }
+
+    private void preflightOpenLeg(OrderRequest request, Taoli quote, BigDecimal baseQuantity,
+            OrderRequest.ExchangeApi api, boolean isLong) throws Exception {
+        if (api == null || blank(api.getEe())) return;
+        String exchange = api.getEe().trim().toLowerCase(Locale.ROOT);
+        if ("binance".equals(exchange)) {
+            testBinanceOrder(formatContract(request.getCoin(), exchange),
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong);
         }
     }
 
@@ -163,7 +182,8 @@ public class ExchangeOrderService {
         String response = switch (exchange) {
             case "ibkr" -> orderIbkr(request, baseQuantity, isLong, false);
             case "okx" -> orderOkx(formatContract(request.getCoin(), exchange),
-                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, strategyKey);
+                    calculateExchangeSize(exchange, baseQuantity, quote, isLong), api,
+                    isLong, false, strategyKey);
             case "binance" -> orderBinance(formatContract(request.getCoin(), exchange),
                     calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, false, strategyKey);
             case "bybit" -> orderBybit(formatContract(request.getCoin(), exchange),
@@ -189,7 +209,9 @@ public class ExchangeOrderService {
         try {
             Object response = switch (exchange) {
                 case "ibkr" -> orderIbkr(request, baseQuantity, isLong, true);
-                case "okx" -> closeOkx(formatContract(request.getCoin(), exchange), api, isLong);
+                case "okx" -> orderOkx(formatContract(request.getCoin(), exchange),
+                        calculateExchangeSize(exchange, baseQuantity, quote, isLong), api,
+                        isLong, true, strategyKey);
                 case "binance" -> orderBinance(formatContract(request.getCoin(), exchange),
                         calculateExchangeSize(exchange, baseQuantity, quote, isLong), api, isLong, true, strategyKey);
                 case "bybit" -> orderBybit(formatContract(request.getCoin(), exchange),
@@ -492,25 +514,27 @@ public class ExchangeOrderService {
         if (key == null) {
             throw new IllegalArgumentException("position key cannot be created");
         }
-        Position position = currentPosition(key);
-        position.setUserId(request.getTemplate().getUr());
-        position.setCoin(request.getCoin());
-        if (longPosition != null) {
-            position.setLongExchange(longPosition.exchange());
-            position.setLongOpenPrice(longPosition.openPrice());
-            position.setLongQuantity(longPosition.quantity());
+        synchronized (positionLock(key)) {
+            Position position = currentPosition(key);
+            position.setUserId(request.getTemplate().getUr());
+            position.setCoin(request.getCoin());
+            if (longPosition != null) {
+                position.setLongExchange(longPosition.exchange());
+                position.setLongOpenPrice(longPosition.openPrice());
+                position.setLongQuantity(longPosition.quantity());
+            }
+            if (shortPosition != null) {
+                position.setShortExchange(shortPosition.exchange());
+                position.setShortOpenPrice(shortPosition.openPrice());
+                position.setShortQuantity(shortPosition.quantity());
+            }
+            if (isOpeningWithoutObservedPosition(position, longPosition, shortPosition)) {
+                position.setUpdatedAt(System.currentTimeMillis());
+                stringRedisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(position));
+                return;
+            }
+            savePosition(key, position);
         }
-        if (shortPosition != null) {
-            position.setShortExchange(shortPosition.exchange());
-            position.setShortOpenPrice(shortPosition.openPrice());
-            position.setShortQuantity(shortPosition.quantity());
-        }
-        if (isOpeningWithoutObservedPosition(position, longPosition, shortPosition)) {
-            position.setUpdatedAt(System.currentTimeMillis());
-            stringRedisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(position));
-            return;
-        }
-        savePosition(key, position);
     }
 
     private static boolean isOpeningWithoutObservedPosition(Position position,
@@ -800,32 +824,37 @@ public class ExchangeOrderService {
             String responseBody) throws Exception {
         JsonNode order = objectMapper.readTree(responseBody);
         BigDecimal fillQuantity = decimal(order, "filled").abs();
-        if (fillQuantity.signum() <= 0) {
+        BigDecimal fillPrice = decimal(order, "averageFillPrice");
+        if (fillQuantity.signum() <= 0 || fillPrice.signum() <= 0) {
             throw new IllegalStateException(
-                    "IBKR close order has no valid fill quantity: " + responseBody);
+                    "IBKR close order has no valid fill details: " + responseBody);
         }
         Integer userId = request.getTemplate() == null ? null : request.getTemplate().getUr();
         if (userId == null) throw new IllegalArgumentException("template.ur is required");
         String key = PositionKey.of(request);
         if (key == null) throw new IllegalArgumentException("position key cannot be created");
-        Position position = currentPosition(key);
-        BigDecimal currentQuantity = isLong
-                ? zeroIfNull(position.getLongQuantity())
-                : zeroIfNull(position.getShortQuantity());
-        BigDecimal remainingQuantity = currentQuantity.subtract(fillQuantity).max(BigDecimal.ZERO)
-                .stripTrailingZeros();
-        if (isLong) {
-            position.setLongQuantity(remainingQuantity);
-            if (remainingQuantity.signum() == 0) position.setLongOpenPrice(BigDecimal.ZERO);
-        } else {
-            position.setShortQuantity(remainingQuantity);
-            if (remainingQuantity.signum() == 0) position.setShortOpenPrice(BigDecimal.ZERO);
+        synchronized (positionLock(key)) {
+            Position position = currentPosition(key);
+            BigDecimal currentQuantity = isLong
+                    ? zeroIfNull(position.getLongQuantity())
+                    : zeroIfNull(position.getShortQuantity());
+            BigDecimal remainingQuantity = currentQuantity.subtract(fillQuantity).max(BigDecimal.ZERO)
+                    .stripTrailingZeros();
+            if (isLong) {
+                position.setLongClosePrice(fillPrice);
+                position.setLongQuantity(remainingQuantity);
+                if (remainingQuantity.signum() == 0) position.setLongOpenPrice(BigDecimal.ZERO);
+            } else {
+                position.setShortClosePrice(fillPrice);
+                position.setShortQuantity(remainingQuantity);
+                if (remainingQuantity.signum() == 0) position.setShortOpenPrice(BigDecimal.ZERO);
+            }
+            savePosition(key, position);
+            log.info("IBKR position reduced: key={}, requestId={}, coin={}, side={}, "
+                            + "fillPrice={}, fillQuantity={}, remainingQuantity={}",
+                    key, requestId, request.getCoin(), isLong ? "long" : "short",
+                    fillPrice, fillQuantity, remainingQuantity);
         }
-        savePosition(key, position);
-        log.info("IBKR position reduced: key={}, requestId={}, coin={}, side={}, "
-                        + "fillQuantity={}, remainingQuantity={}",
-                key, requestId, request.getCoin(), isLong ? "long" : "short",
-                fillQuantity, remainingQuantity);
     }
 
     private void savePosition(String key, Position position) throws Exception {
@@ -842,6 +871,7 @@ public class ExchangeOrderService {
             position.setStatus("PARTIAL");
         }
         position.setUpdatedAt(System.currentTimeMillis());
+        closeProfitService.recordIfReady(position);
         stringRedisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(position));
         log.info("Arbitrage position saved: key={}, coin={}, longQuantity={}, shortQuantity={}, status={}",
                 key, position.getCoin(), longQuantity, shortQuantity, position.getStatus());
@@ -913,13 +943,13 @@ public class ExchangeOrderService {
                 || "local_rejected".equalsIgnoreCase(status);
     }
 
-    private String orderOkx(String coin, BigDecimal size, OrderRequest.ExchangeApi api, boolean isLong,
-            String strategyKey)
+    private String orderOkx(String coin, BigDecimal size, OrderRequest.ExchangeApi api,
+            boolean isLong, boolean close, String strategyKey)
             throws Exception {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("instId", coin);
         body.put("ordType", "market");
-        body.put("side", isLong ? "buy" : "sell");
+        body.put("side", close ? (isLong ? "sell" : "buy") : (isLong ? "buy" : "sell"));
         body.put("posSide", isLong ? "long" : "short");
         body.put("tdMode", "cross");
         body.put("sz", size.stripTrailingZeros().toPlainString());
@@ -934,26 +964,8 @@ public class ExchangeOrderService {
                 "OK-ACCESS-PASSPHRASE", required(api.getAp(), "OKX passphrase")));
         String responseBody = requireOkxSuccess(response);
         scheduleOrderQuery(new OrderQuery("okx", coin, api, orderId(responseBody, "OKX"),
-                null, isLong, false, strategyKey));
+                null, isLong, close, strategyKey));
         return responseBody;
-    }
-
-    private String closeOkx(String coin, OrderRequest.ExchangeApi api, boolean isLong)
-            throws Exception {
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("instId", coin);
-        body.put("posSide", isLong ? "long" : "short");
-        body.put("mgnMode", "cross");
-        String path = "/api/v5/trade/close-position";
-        String requestBody = objectMapper.writeValueAsString(body);
-        String timestamp = OKX_TIME.format(Instant.now());
-        HttpResponse<String> response = send("https://www.okx.com" + path, "POST", requestBody, Map.of(
-                "OK-ACCESS-KEY", required(api.getAk(), "OKX apiKey"),
-                "OK-ACCESS-SIGN", hmacBase64("HmacSHA256", required(api.getAc(), "OKX secretKey"),
-                        timestamp + "POST" + path + requestBody),
-                "OK-ACCESS-TIMESTAMP", timestamp,
-                "OK-ACCESS-PASSPHRASE", required(api.getAp(), "OKX passphrase")));
-        return requireOkxSuccess(response);
     }
 
     private String orderBinance(String coin, BigDecimal size, OrderRequest.ExchangeApi api,
@@ -975,6 +987,53 @@ public class ExchangeOrderService {
         scheduleOrderQuery(new OrderQuery("binance", coin, api, orderId(responseBody, "Binance"),
                 text(objectMapper.readTree(responseBody), "clientOrderId"), isLong, close, strategyKey));
         return responseBody;
+    }
+
+    private Object positionLock(String key) {
+        return positionLocks.computeIfAbsent(key, ignored -> new Object());
+    }
+
+    private void saveCloseExecution(String strategyKey, boolean isLong, BigDecimal averagePrice)
+            throws Exception {
+        if (blank(strategyKey) || averagePrice == null || averagePrice.signum() <= 0) {
+            throw new IllegalStateException("close order average fill price is unavailable");
+        }
+        synchronized (positionLock(strategyKey)) {
+            Position position = currentPosition(strategyKey);
+            if (blank(position.getCloseRequestId())) {
+                log.warn("Close profit context is missing: key={}", strategyKey);
+                return;
+            }
+            if (isLong) {
+                position.setLongClosePrice(averagePrice);
+            } else {
+                position.setShortClosePrice(averagePrice);
+            }
+            position.setUpdatedAt(System.currentTimeMillis());
+            closeProfitService.recordIfReady(position);
+            stringRedisTemplate.opsForValue().set(
+                    strategyKey, objectMapper.writeValueAsString(position));
+            log.info("Close execution saved: key={}, side={}, averagePrice={}",
+                    strategyKey, isLong ? "long" : "short", averagePrice);
+        }
+    }
+
+    private void testBinanceOrder(String coin, BigDecimal size, OrderRequest.ExchangeApi api,
+            boolean isLong) throws Exception {
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", coin);
+        params.put("side", isLong ? "BUY" : "SELL");
+        params.put("positionSide", isLong ? "LONG" : "SHORT");
+        params.put("type", "MARKET");
+        params.put("quantity", size.stripTrailingZeros().toPlainString());
+        params.put("recvWindow", "5000");
+        params.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        String query = query(params);
+        String signedQuery = query + "&signature="
+                + hmacHex("HmacSHA256", required(api.getAc(), "Binance secretKey"), query);
+        HttpResponse<String> response = send("https://fapi.binance.com/fapi/v1/order/test?" + signedQuery,
+                "POST", "", Map.of("X-MBX-APIKEY", required(api.getAk(), "Binance apiKey")));
+        requireSuccess(response, "Binance order test");
     }
 
     private String orderBybit(String coin, BigDecimal size, OrderRequest.ExchangeApi api,
@@ -1101,6 +1160,15 @@ public class ExchangeOrderService {
                         query.exchange(), query.orderId(), result.status());
                 if (isOrderFilled(query.exchange(), result.status())
                         || isOrderFinal(query.exchange(), result.status())) {
+                    if (query.close() && isOrderFilled(query.exchange(), result.status())) {
+                        if (result.averagePrice() == null || result.averagePrice().signum() <= 0) {
+                            log.warn("{} close order has no average fill price yet: orderId={}",
+                                    query.exchange(), query.orderId());
+                            Thread.sleep(1_000L);
+                            continue;
+                        }
+                        saveCloseExecution(query.strategyKey(), query.isLong(), result.averagePrice());
+                    }
                     resolved = true;
                     return;
                 }
@@ -1123,7 +1191,7 @@ public class ExchangeOrderService {
             case "bybit" -> queryBybitOrder(query);
             case "bitget" -> queryBitgetOrder(query);
             case "gate", "gateio" -> queryGateOrder(query);
-            default -> new OrderQueryResult(false, "");
+            default -> new OrderQueryResult(false, "", BigDecimal.ZERO);
         };
     }
 
@@ -1142,9 +1210,10 @@ public class ExchangeOrderService {
         JsonNode root = objectMapper.readTree(body);
         JsonNode data = root.get("data");
         if (!"0".equals(text(root, "code")) || data == null || data.size() == 0) {
-            return new OrderQueryResult(false, "");
+            return new OrderQueryResult(false, "", BigDecimal.ZERO);
         }
-        return new OrderQueryResult(true, text(data.get(0), "state"));
+        JsonNode order = data.get(0);
+        return new OrderQueryResult(true, text(order, "state"), decimal(order, "avgPx"));
     }
 
     private OrderQueryResult queryBinanceOrder(OrderQuery query) throws Exception {
@@ -1161,8 +1230,8 @@ public class ExchangeOrderService {
                 "GET", "", Map.of("X-MBX-APIKEY", required(query.api().getAk(), "Binance apiKey")));
         String body = requireSuccess(response, "Binance order query");
         JsonNode root = objectMapper.readTree(body);
-        if (!root.has("orderId")) return new OrderQueryResult(false, "");
-        return new OrderQueryResult(true, text(root, "status"));
+        if (!root.has("orderId")) return new OrderQueryResult(false, "", BigDecimal.ZERO);
+        return new OrderQueryResult(true, text(root, "status"), decimal(root, "avgPrice"));
     }
 
     private OrderQueryResult queryBybitOrder(OrderQuery query) throws Exception {
@@ -1186,9 +1255,10 @@ public class ExchangeOrderService {
         JsonNode root = objectMapper.readTree(body);
         JsonNode rows = root.get("result") == null ? null : root.get("result").get("list");
         if (!"0".equals(text(root, "retCode")) || rows == null || rows.size() == 0) {
-            return new OrderQueryResult(false, "");
+            return new OrderQueryResult(false, "", BigDecimal.ZERO);
         }
-        return new OrderQueryResult(true, text(rows.get(0), "orderStatus"));
+        JsonNode order = rows.get(0);
+        return new OrderQueryResult(true, text(order, "orderStatus"), decimal(order, "avgPrice"));
     }
 
     private OrderQueryResult queryBitgetOrder(OrderQuery query) throws Exception {
@@ -1212,9 +1282,9 @@ public class ExchangeOrderService {
         JsonNode root = objectMapper.readTree(body);
         JsonNode data = root.get("data");
         if (!"00000".equals(text(root, "code")) || data == null || data.isNull()) {
-            return new OrderQueryResult(false, "");
+            return new OrderQueryResult(false, "", BigDecimal.ZERO);
         }
-        return new OrderQueryResult(true, text(data, "state"));
+        return new OrderQueryResult(true, text(data, "state"), decimal(data, "priceAvg"));
     }
 
     private OrderQueryResult queryGateOrder(OrderQuery query) throws Exception {
@@ -1229,8 +1299,8 @@ public class ExchangeOrderService {
                         "SIGN", hmacHex("HmacSHA512", required(query.api().getAc(), "Gate secretKey"), preSign)));
         String body = requireSuccess(response, "Gate order query");
         JsonNode root = objectMapper.readTree(body);
-        if (!root.has("id")) return new OrderQueryResult(false, "");
-        return new OrderQueryResult(true, text(root, "status"));
+        if (!root.has("id")) return new OrderQueryResult(false, "", BigDecimal.ZERO);
+        return new OrderQueryResult(true, text(root, "status"), decimal(root, "fill_price"));
     }
 
     private static boolean isOrderFilled(String exchange, String status) {
@@ -1438,6 +1508,11 @@ public class ExchangeOrderService {
                         "side", isBuy ? "buy" : "sell", "quantity", size, "price", price,
                         "reduceOnly", true, "orderStatus", "ALREADY_CLOSED", "response", result);
             }
+            String error = text(orderResult, "error");
+            if (!error.isBlank()) {
+                throw new IllegalStateException("Hyperliquid order rejected: " + error
+                        + "; response=" + responseBody);
+            }
             throw new IllegalStateException("Hyperliquid order was not filled: " + responseBody);
         }
         long orderId = filled.get("oid").asLong();
@@ -1480,7 +1555,11 @@ public class ExchangeOrderService {
                 return;
             }
             JsonNode filled = objectMapper.readTree(filledJson);
-            if (!close) saveHyperliquidPosition(request, isBuy, orderId, filled, result);
+            if (close) {
+                saveCloseExecution(strategyKey, !isBuy, decimal(filled, "avgPx"));
+            } else {
+                saveHyperliquidPosition(request, isBuy, orderId, filled, result);
+            }
             resolved = true;
         } catch (Exception e) {
             log.warn("Hyperliquid background order query failed: orderId={}, position update skipped",
@@ -1756,7 +1835,7 @@ public class ExchangeOrderService {
             String orderId, String clientOrderId, boolean isLong, boolean close,
             String strategyKey) {}
 
-    private record OrderQueryResult(boolean found, String status) {}
+    private record OrderQueryResult(boolean found, String status, BigDecimal averagePrice) {}
 
     private record Signature(String r, String s, int v) {
         Map<String, Object> toMap() { return Map.of("r", r, "s", s, "v", v); }

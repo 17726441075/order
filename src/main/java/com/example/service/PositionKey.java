@@ -29,7 +29,7 @@ final class PositionKey {
                 + normalizeExchange(longExchange) + ":" + normalizeExchange(shortExchange);
     }
 
-    private static String normalizeExchange(String exchange) {
+    static String normalizeExchange(String exchange) {
         String value = exchange.trim().toLowerCase(Locale.ROOT);
         return switch (value) {
             case "hyper" -> "hyperliquid";
@@ -38,7 +38,7 @@ final class PositionKey {
         };
     }
 
-    private static String baseCoin(String coin) {
+    static String baseCoin(String coin) {
         String value = coin.trim().toUpperCase(Locale.ROOT);
         int colon = value.lastIndexOf(':');
         if (colon >= 0 && colon + 1 < value.length()) {

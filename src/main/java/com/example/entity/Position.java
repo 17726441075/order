@@ -22,6 +22,14 @@ public class Position {
     private BigDecimal shortQuantity;
     private BigDecimal matchedQuantity;
     private BigDecimal openedAmount;
+    private String closeRequestId;
+    private BigDecimal closeLongOpenPrice;
+    private BigDecimal closeShortOpenPrice;
+    private BigDecimal closeLongQuantity;
+    private BigDecimal closeShortQuantity;
+    private BigDecimal longClosePrice;
+    private BigDecimal shortClosePrice;
+    private Boolean profitRecorded;
     private String status;
     private Long updatedAt;
 }

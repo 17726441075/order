@@ -3,6 +3,7 @@ package com.example.service;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.math.BigDecimal;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -30,6 +31,7 @@ public class QiqiRedisTask {
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
     private final ExchangeOrderService exchangeOrderService;
+    private final CloseProfitService closeProfitService;
     private final AtomicBoolean processing = new AtomicBoolean();
     @Getter
     private volatile ArrayList<Taoli> taoliList = new ArrayList<>();
@@ -83,6 +85,9 @@ public class QiqiRedisTask {
         if (template.getSs() != null && template.getSs() != 1) {
             return;
         }
+        if (isOrderSuspended(user)) {
+            return;
+        }
 
         Taoli quote = findQuote(user);
         if (quote == null) {
@@ -109,6 +114,12 @@ public class QiqiRedisTask {
         }
 
         if (isClosed(position)) {
+            closeProfitService.recordIfReady(position);
+            if (StringUtils.hasText(position.getCloseRequestId())
+                    && !Boolean.TRUE.equals(position.getProfitRecorded())) {
+                persistPosition(user, position);
+                return;
+            }
             if (openedAmount.signum() > 0) {
                 position.setOpenedAmount(BigDecimal.ZERO);
                 openedAmount = BigDecimal.ZERO;
@@ -191,6 +202,7 @@ public class QiqiRedisTask {
 
     private void closePosition(OrderRequest user, Position position, Taoli quote) {
         OrderRequest.OrderTemplate template = user.getTemplate();
+        closeProfitService.prepareClose(position);
         position = markPositionStatus(user, position, "CLOSING");
         persistPosition(user, position);
         log.info("Arbitrage close before: userId={}, coin={}, longExchange={}, shortExchange={}, "
@@ -370,5 +382,21 @@ public class QiqiRedisTask {
             String normalized = value.replace("\r", "").replace("\n", "");
             return objectMapper.readValue(normalized, OrderRequest.class);
         }
+    }
+
+    private boolean isOrderSuspended(OrderRequest user) {
+        OrderRequest.OrderTemplate template = user.getTemplate();
+        if (template.getUr() == null || user.getLongApi() == null || user.getShortApi() == null
+                || !StringUtils.hasText(user.getLongApi().getEe())
+                || !StringUtils.hasText(user.getShortApi().getEe())) {
+            return false;
+        }
+        String key = "qiqi:" + template.getUr()
+                + ":" + user.getCoin().trim().toUpperCase(Locale.ROOT)
+                + ":" + normalizeExchange(user.getLongApi().getEe())
+                + ":" + normalizeExchange(user.getShortApi().getEe())
+                + ":hang";
+        String value = stringRedisTemplate.opsForValue().get(key);
+        return "true".equalsIgnoreCase(value == null ? null : value.trim());
     }
 }

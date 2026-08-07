@@ -81,6 +81,7 @@ public class QiqiRedisTask {
         if (user == null || user.getTemplate() == null || !StringUtils.hasText(user.getCoin())) {
             return;
         }
+        OrderRequestPolicy.validateIbkrUser(user);
         OrderRequest.OrderTemplate template = user.getTemplate();
         if (template.getSs() != null && template.getSs() != 1) {
             return;

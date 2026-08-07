@@ -51,6 +51,7 @@ public class ExchangeApiValidationService {
         if (request == null) {
             throw new IllegalArgumentException("order request is required");
         }
+        OrderRequestPolicy.validateIbkrUser(request);
         validateApi("longApi", request.getLongApi());
         validateApi("shortApi", request.getShortApi());
     }

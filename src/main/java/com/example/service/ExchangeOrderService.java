@@ -102,6 +102,7 @@ public class ExchangeOrderService {
                 || orderAmount.signum() <= 0) {
             throw new IllegalArgumentException("orderAmount must be greater than 0");
         }
+        OrderRequestPolicy.validateIbkrUser(request);
         if (isOrderReplacementBlocked(request)) {
             throw new IllegalStateException("order query is pending or missing; replacement order skipped");
         }
@@ -193,6 +194,7 @@ public class ExchangeOrderService {
         if (request == null || position == null) {
             throw new IllegalArgumentException("position is required");
         }
+        OrderRequestPolicy.validateIbkrUser(request);
         Map<String, Object> result = new LinkedHashMap<>();
         List<Exception> failures = new ArrayList<>();
         try {
